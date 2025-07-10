@@ -1,2 +1,62 @@
 # arbot
-`arbot` is a modular, real-time arbitrage trading bot that monitors and exploits price spreads between multiple centralized crypto exchanges (e.g., Binance, Bybit, OKX, Bitget). It supports both real-time trading and simulation modes and is controlled via a terminal-based UI using Textual.
+
+**arbot**은 다중 거래소 간 실시간 가격 차이를 이용해 자동으로 차익거래(arbitrage)를 수행하는 고성능 Python 기반 트레이딩 시스템입니다. 실거래 모드뿐 아니라 시뮬레이션, 백테스트 기능도 포함하며, 직관적인 TUI (Textual UI)를 제공합니다.
+
+---
+
+## 🧠 주요 기능
+
+- ✅ **실시간 가격 수집**: WebSocket을 이용한 Binance, Bybit, OKX, Bitget 가격 모니터링
+- ⚡ **차익거래 전략**: 스프레드 계산, 수수료 및 슬리피지 고려
+- 🤖 **자동 주문 실행**: 실시간 또는 시뮬레이션 기반 주문 처리
+- 📊 **SQLite 기록**: 거래 기록, 잔고, 전략 설정 등을 로컬 DB로 관리
+- 🧪 **시뮬레이션 & 백테스트**: 실시간 가격 기반 모의 거래 및 과거 데이터 기반 전략 검증
+- 💻 **Textual UI**: 실시간 정보, 스프레드, 잔고, 트레이드 로그 등 시각화된 CLI 대시보드
+- 🧱 **모듈형 구조**: 거래소별 폴더 분리 및 인터페이스 표준화
+
+---
+
+## ⚙️ 실행 모드
+
+| 모드 | 설명 |
+|------|------|
+| 실시간 모드 | 실 API 키로 실제 거래소에서 주문 실행 |
+| 시뮬레이션 모드 | 실시간 가격 데이터로 가상 주문 시뮬레이션 (Testnet 미사용) |
+| 백테스트 모드 | 저장된 과거 가격 데이터로 전략 검증 수행 |
+
+---
+
+## 🏁 시작하기
+
+### 1. 의존성 설치
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. 설정 파일 편집
+```python
+# config.py
+BINANCE_API_KEY = "..."
+BYBIT_API_SECRET = "..."
+ARBITRAGE_THRESHOLD = 0.4  # 최소 스프레드 (%)
+```
+
+### 3. 실행
+```bash
+python main.py --mode sim       # 시뮬레이션 모드
+python main.py --mode live      # 실거래 모드
+python main.py --mode backtest  # 백테스트 모드
+```
+
+---
+## 🧩 확장 방법
+- 새 거래소 추가 시 exchanges/ 하위에 [이름]/client.py 생성
+- BaseExchange 인터페이스를 구현하면 자동 연동됨
+- UI 및 전략은 거래소 독립적으로 동작
+
+---
+## 🛡️ 주의사항
+- Testnet은 사용하지 않으며, 모든 데이터는 실제 거래소 가격 기반입니다.
+- 실거래 모드는 반드시 소액으로 테스트한 후 사용하세요.
+- 시장 급변시 손실 가능성 있음 — 전략과 리스크 관리 필수입니다.
