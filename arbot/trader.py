@@ -6,10 +6,10 @@ from enum import Enum
 import logging
 from datetime import datetime
 
-from exchanges.base import BaseExchange, Order, OrderSide, OrderType, OrderStatus
-from database import Database, TradeRecord, OrderRecord, BalanceRecord
-from strategy import ArbitrageSignal
-from config import Config
+from .exchanges.base import BaseExchange, Order, OrderSide, OrderType, OrderStatus
+from .database import Database, TradeRecord, OrderRecord, BalanceRecord
+from .strategy import ArbitrageSignal
+from .config import Config
 
 logger = logging.getLogger(__name__)
 

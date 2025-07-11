@@ -115,19 +115,60 @@ LOG_LEVEL=INFO
 
 #### 시뮬레이션 모드 (추천 - 처음 사용자)
 ```bash
-python main.py
+python run.py
 # 또는
-python main.py --mode simulation
+python run.py --mode simulation
+# 또는 (패키지 설치 후)
+python -m arbot.main
 ```
 
 #### 실거래 모드 (주의: 실제 자금 사용)
 ```bash
-python main.py --mode live
+python run.py --mode live
 ```
 
 #### 백테스트 모드
 ```bash
-python main.py --mode backtest
+python run.py --mode backtest
+```
+
+---
+
+## 📁 프로젝트 구조
+
+```
+arbot/
+├── arbot/                  # 메인 소스코드 패키지
+│   ├── __init__.py
+│   ├── main.py            # 메인 실행 파일
+│   ├── config.py          # 설정 관리
+│   ├── database.py        # 데이터베이스 모델
+│   ├── strategy.py        # 차익거래 전략
+│   ├── trader.py          # 실거래 모듈
+│   ├── simulator.py       # 시뮬레이션 모듈
+│   ├── backtester.py      # 백테스트 엔진
+│   ├── ui.py             # 사용자 인터페이스
+│   ├── technical_indicators.py  # 기술적 지표
+│   └── exchanges/         # 거래소 어댑터들
+│       ├── __init__.py
+│       ├── base.py       # 베이스 거래소 클래스
+│       ├── binance.py    # 바이낸스 어댑터
+│       ├── bybit.py      # 바이비트 어댑터
+│       ├── okx.py        # OKX 어댑터
+│       └── bitget.py     # 비트겟 어댑터
+├── tests/                 # 테스트 파일들
+├── scripts/               # 디버그/유틸리티 스크립트
+├── data/                  # 데이터 파일들
+│   ├── arbot.db          # SQLite 데이터베이스
+│   └── logs/             # 로그 파일들
+├── docker/               # Docker 관련 파일들
+├── run.py                # 실행 스크립트
+├── config.json           # 메인 설정 파일
+├── config.local.json     # 로컬 설정 파일
+├── .env.example          # 환경변수 예시
+├── requirements.txt      # Python 의존성
+├── pyproject.toml        # 프로젝트 설정
+└── setup.py             # 설치 스크립트
 ```
 
 ---

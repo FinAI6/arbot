@@ -20,12 +20,12 @@ from rich.text import Text
 from rich.panel import Panel
 from rich.align import Align
 
-from config import Config, TradingMode
-from database import Database
-from strategy import ArbitrageStrategy, ArbitrageSignal
-from trader import LiveTrader
-from simulator import TradingSimulator
-from backtester import Backtester
+from .config import Config, TradingMode
+from .database import Database
+from .strategy import ArbitrageStrategy, ArbitrageSignal
+from .trader import LiveTrader
+from .simulator import TradingSimulator
+from .backtester import Backtester
 
 logger = logging.getLogger(__name__)
 

@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 import logging
 
-from exchanges.base import Order, OrderSide, OrderType, OrderStatus
-from database import Database, TradeRecord, OrderRecord
-from strategy import ArbitrageSignal
-from config import Config
+from .exchanges.base import Order, OrderSide, OrderType, OrderStatus
+from .database import Database, TradeRecord, OrderRecord
+from .strategy import ArbitrageSignal
+from .config import Config
 
 logger = logging.getLogger(__name__)
 

@@ -14,14 +14,14 @@ from typing import Dict, Optional, List, Tuple
 from datetime import datetime
 import time
 
-from config import Config, TradingMode
-from database import Database
-from strategy import ArbitrageStrategy
-from trader import LiveTrader
-from simulator import TradingSimulator
-from backtester import Backtester
-from ui import run_ui
-from exchanges import BinanceExchange, BybitExchange, BitgetExchange, OKXExchange
+from .config import Config, TradingMode
+from .database import Database
+from .strategy import ArbitrageStrategy
+from .trader import LiveTrader
+from .simulator import TradingSimulator
+from .backtester import Backtester
+from .ui import run_ui
+from .exchanges import BinanceExchange, BybitExchange, BitgetExchange, OKXExchange
 
 # Configure logging
 logging.basicConfig(

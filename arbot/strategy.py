@@ -6,9 +6,9 @@ from datetime import datetime, timedelta
 import logging
 from collections import defaultdict, deque
 
-from exchanges.base import BaseExchange, Ticker, OrderSide
-from database import Database, ArbitrageOpportunity, TickerRecord
-from config import Config
+from .exchanges.base import BaseExchange, Ticker, OrderSide
+from .database import Database, ArbitrageOpportunity, TickerRecord
+from .config import Config
 
 logger = logging.getLogger(__name__)
 

@@ -7,11 +7,11 @@ from dataclasses import dataclass, field
 import logging
 import pandas as pd
 
-from database import Database, TickerRecord, TradeRecord
-from strategy import ArbitrageStrategy, ArbitrageSignal
-from simulator import TradingSimulator
-from exchanges.base import Ticker
-from config import Config
+from .database import Database, TickerRecord, TradeRecord
+from .strategy import ArbitrageStrategy, ArbitrageSignal
+from .simulator import TradingSimulator
+from .exchanges.base import Ticker
+from .config import Config
 
 logger = logging.getLogger(__name__)
 

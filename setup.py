@@ -53,7 +53,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "arbot=main:main",
+            "arbot=arbot.main:main",
         ],
     },
     include_package_data=True,

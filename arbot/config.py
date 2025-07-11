@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 import json
 from dotenv import load_dotenv
+from pathlib import Path
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file in parent directory
+parent_dir = Path(__file__).parent.parent
+load_dotenv(parent_dir / ".env")
 
 
 class TradingMode(Enum):
@@ -61,7 +63,7 @@ class RiskManagementConfig:
 
 @dataclass
 class DatabaseConfig:
-    db_path: str = "arbot.db"
+    db_path: str = "data/arbot.db"
     backup_interval_hours: int = 24
     max_history_days: int = 30
 
@@ -85,8 +87,10 @@ class BacktestConfig:
 
 class Config:
     def __init__(self, config_file: str = "config.json"):
-        self.config_file = config_file
-        self.local_config_file = config_file.replace('.json', '.local.json')
+        # Config files are in parent directory
+        parent_dir = Path(__file__).parent.parent
+        self.config_file = parent_dir / config_file
+        self.local_config_file = parent_dir / config_file.replace('.json', '.local.json')
         self.trading_mode = TradingMode.SIMULATION
         self.exchanges: Dict[str, ExchangeConfig] = {}
         self.arbitrage = ArbitrageConfig()
@@ -282,6 +286,10 @@ class Config:
         db_path = os.getenv("DATABASE_PATH")
         if db_path:
             self.database.db_path = db_path
+        else:
+            # Default to relative path from project root
+            parent_dir = Path(__file__).parent.parent
+            self.database.db_path = str(parent_dir / "data" / "arbot.db")
         
         # Log level
         log_level = os.getenv("LOG_LEVEL")

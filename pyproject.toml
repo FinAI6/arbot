@@ -1,7 +1,51 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "arbot"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "A modular, real-time arbitrage trading bot for cryptocurrency exchanges"
 readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+requires-python = ">=3.8"
+authors = [
+    {name = "Euiyun Kim", email = "geniuskey@gmail.com"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "aiohttp>=3.8.0",
+    "websockets>=11.0.0",
+    "sqlalchemy>=2.0.0",
+    "textual>=0.40.0",
+    "python-dotenv>=1.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "rich>=13.0.0"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/FinAI6/arbot"
+"Bug Reports" = "https://github.com/FinAI6/arbot/issues"
+"Source" = "https://github.com/FinAI6/arbot"
+
+[project.scripts]
+arbot = "arbot.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["arbot*"]
