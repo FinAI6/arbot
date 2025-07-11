@@ -44,9 +44,9 @@ ARBITRAGE_THRESHOLD = 0.4  # 최소 스프레드 (%)
 
 ### 3. 실행
 ```bash
-python main.py --mode sim       # 시뮬레이션 모드
-python main.py --mode live      # 실거래 모드
-python main.py --mode backtest  # 백테스트 모드
+python main.py --mode simulation    # 시뮬레이션 모드
+python main.py --mode live          # 실거래 모드
+python main.py --mode backtest      # 백테스트 모드
 ```
 
 ---
