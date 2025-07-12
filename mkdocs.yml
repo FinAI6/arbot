@@ -1,0 +1,103 @@
+site_name: ArBot - Arbitrage Trading Bot
+site_description: A modular, real-time arbitrage trading bot for cryptocurrency exchanges
+site_author: Euiyun Kim
+site_url: https://finai6.github.io/arbot/
+
+repo_name: FinAI6/arbot
+repo_url: https://github.com/FinAI6/arbot
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    # Palette toggle for light mode
+    - scheme: default
+      primary: blue
+      accent: light blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Palette toggle for dark mode
+    - scheme: slate
+      primary: blue
+      accent: light blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.action.edit
+    - content.action.view
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - git-revision-date-localized:
+      enable_creation_date: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: installation.md
+    - Quick Start: quickstart.md
+    - Configuration: configuration.md
+  - Features:
+    - Core Features: features/core.md
+    - GUI Interface: features/gui.md
+    - Exchange Support: features/exchanges.md
+    - Arbitrage Strategy: features/arbitrage.md
+    - Risk Management: features/risk.md
+  - User Guide:
+    - Trading Modes: guide/trading-modes.md
+    - Symbol Management: guide/symbols.md
+    - Quote Currencies: guide/quotes.md
+    - Moving Averages: guide/moving-averages.md
+    - Trend Filtering: guide/trend-filtering.md
+    - Settings Panel: guide/settings.md
+  - Technical Reference:
+    - Architecture: technical/architecture.md
+    - Database Schema: technical/database.md
+    - API Reference: technical/api.md
+    - Troubleshooting: technical/troubleshooting.md
+  - Development:
+    - Contributing: development/contributing.md
+    - Testing: development/testing.md
+    - Docker Deployment: development/docker.md
+  - About:
+    - License: about/license.md
+    - Changelog: about/changelog.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/FinAI6/arbot
+    - icon: fontawesome/solid/envelope
+      link: mailto:geniuskey@gmail.com
+  version:
+    provider: mike
+
+copyright: Copyright &copy; 2025 Euiyun Kim
