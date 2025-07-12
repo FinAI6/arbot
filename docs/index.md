@@ -1,10 +1,11 @@
 # ArBot - Arbitrage Trading Bot
 
-![ArBot Logo](https://img.shields.io/badge/ArBot-Arbitrage%20Trading%20Bot-blue?style=for-the-badge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
 **ArBot** is a modular, real-time arbitrage trading bot that monitors and exploits price spreads between multiple centralized cryptocurrency exchanges. It supports both real-time trading and simulation modes and is controlled via a modern tkinter-based GUI.
+
+![](images/arbot_ui_mode.png)
 
 ## 🚀 Key Features
 
