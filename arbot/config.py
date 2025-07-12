@@ -44,11 +44,24 @@ class ArbitrageConfig:
     max_trades_per_hour: int = 50
     trade_amount_usd: float = 100.0
     symbols: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
-    min_volume_usdt: float = 500000.0  # Minimum 24h volume in USDT
+    max_symbols: int = 200  # Maximum number of symbols to monitor
     slippage_tolerance: float = 0.001  # 0.1%
     max_spread_age_seconds: float = 5.0
     use_dynamic_symbols: bool = True
     max_spread_threshold: float = 2.0  # Maximum spread percentage (200%) to filter out anomalies
+    
+    # Symbol filtering by quote currency
+    enabled_quote_currencies: List[str] = field(default_factory=lambda: ["USDT"])  # Enabled quote currencies
+    available_quote_currencies: List[str] = field(default_factory=lambda: ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"])  # All available options
+    
+    # Moving average settings
+    moving_average_periods: int = 30  # Moving average period in seconds
+    
+    # Trend-based arbitrage filtering
+    use_trend_filter: bool = True  # Enable trend-based arbitrage filtering
+    trend_filter_mode: str = "uptrend_buy_low"  # Modes: "uptrend_buy_low", "downtrend_sell_high", "both", "disabled"
+    trend_confirmation_threshold: float = 0.001  # 0.1% price movement to confirm trend
+    
     premium_detection: PremiumDetectionConfig = field(default_factory=PremiumDetectionConfig)
 
 
@@ -192,11 +205,17 @@ class Config:
                 max_trades_per_hour=arb_data.get('max_trades_per_hour', 50),
                 trade_amount_usd=arb_data.get('trade_amount_usd', 100.0),
                 symbols=arb_data.get('symbols', ["BTCUSDT", "ETHUSDT"]),
-                min_volume_usdt=arb_data.get('min_volume_usdt', 500000.0),
+                max_symbols=arb_data.get('max_symbols', 200),
                 slippage_tolerance=arb_data.get('slippage_tolerance', 0.001),
                 max_spread_age_seconds=arb_data.get('max_spread_age_seconds', 5.0),
                 use_dynamic_symbols=arb_data.get('use_dynamic_symbols', True),
                 max_spread_threshold=arb_data.get('max_spread_threshold', 2.0),
+                enabled_quote_currencies=arb_data.get('enabled_quote_currencies', ["USDT"]),
+                available_quote_currencies=arb_data.get('available_quote_currencies', ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"]),
+                moving_average_periods=arb_data.get('moving_average_periods', 30),
+                use_trend_filter=arb_data.get('use_trend_filter', True),
+                trend_filter_mode=arb_data.get('trend_filter_mode', "uptrend_buy_low"),
+                trend_confirmation_threshold=arb_data.get('trend_confirmation_threshold', 0.001),
                 premium_detection=premium_config
             )
         

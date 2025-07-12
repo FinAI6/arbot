@@ -26,13 +26,14 @@ from .strategy import ArbitrageStrategy, ArbitrageSignal
 from .trader import LiveTrader
 from .simulator import TradingSimulator
 from .backtester import Backtester
+from .exchanges import BinanceExchange, BybitExchange
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class UIState:
-    is_running: bool = False
+    trading_active: bool = False
     trading_mode: TradingMode = TradingMode.SIMULATION
     connected_exchanges: List[str] = None
     active_symbols: List[str] = None
@@ -55,7 +56,7 @@ class StatusWidget(Static):
         status_text = Text()
         
         # Trading status
-        if self.state.is_running:
+        if self.state.trading_active:
             status_text.append("● RUNNING", style="bold green")
         else:
             status_text.append("● STOPPED", style="bold red")
@@ -256,7 +257,7 @@ class BalanceWidget(Static):
 class ControlPanel(Container):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.is_running = False
+        self.trading_active = False
     
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -307,7 +308,7 @@ class ArbitrageBotApp(App):
         
         # UI state
         self.ui_state = UIState()
-        self.is_running = False
+        self.trading_active = False
         self.last_update = 0
         
         # Data for widgets
@@ -382,12 +383,15 @@ class ArbitrageBotApp(App):
     async def _initialize_components(self):
         """Initialize trading components"""
         try:
+            logger.info("Starting UI component initialization")
+            
             # Initialize database
+            logger.info("Initializing database")
             await self.database.initialize()
+            logger.info("Database initialized successfully")
             
             # Initialize exchanges
-            from exchanges import BinanceExchange, BybitExchange
-            
+            logger.info("Initializing exchanges")
             for exchange_name, exchange_config in self.config.exchanges.items():
                 if not exchange_config.enabled:
                     continue
@@ -408,29 +412,43 @@ class ArbitrageBotApp(App):
                     continue
                 
                 self.exchanges[exchange_name] = exchange
+                logger.info(f"Created exchange: {exchange_name}")
+            
+            logger.info(f"Created {len(self.exchanges)} exchanges")
             
             # Initialize strategy
+            logger.info("Initializing arbitrage strategy")
             self.strategy = ArbitrageStrategy(self.config, self.database)
             await self.strategy.initialize(self.exchanges)
             self.strategy.add_signal_callback(self._on_arbitrage_signal)
+            logger.info("Strategy initialized successfully")
             
             # Initialize trader/simulator based on mode
+            logger.info(f"Initializing trader/simulator for mode: {self.config.trading_mode}")
             if self.config.trading_mode == TradingMode.LIVE:
                 self.trader = LiveTrader(self.config, self.database)
                 await self.trader.initialize(self.exchanges)
+                logger.info("Live trader initialized successfully")
             else:
                 self.simulator = TradingSimulator(self.config, self.database)
+                logger.info("Simulator initialized successfully")
             
             # Initialize backtester
+            logger.info("Initializing backtester")
             self.backtester = Backtester(self.config, self.database)
+            logger.info("Backtester initialized successfully")
             
             # Update UI state
+            logger.info("Updating UI state")
             self.ui_state.trading_mode = self.config.trading_mode
             self.ui_state.connected_exchanges = list(self.exchanges.keys())
             self.ui_state.active_symbols = self.config.arbitrage.symbols
+            logger.info("UI component initialization completed successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize components: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             await self.action_quit()
     
     async def _update_loop(self):
@@ -511,7 +529,7 @@ class ArbitrageBotApp(App):
                 ]
             
             # Update UI state
-            self.ui_state.is_running = self.is_running
+            self.ui_state.trading_active = self.trading_active
             self.ui_state.last_update = current_time
             
             # Update widgets
@@ -564,7 +582,7 @@ class ArbitrageBotApp(App):
     
     async def action_start_stop(self):
         """Start or stop the trading bot"""
-        if self.is_running:
+        if self.trading_active:
             await self._stop_bot()
         else:
             await self._start_bot()
@@ -586,7 +604,7 @@ class ArbitrageBotApp(App):
             for exchange_name, exchange in self.exchanges.items():
                 await exchange.connect_ws(self.config.arbitrage.symbols)
             
-            self.is_running = True
+            self.trading_active = True
             logger.info("Trading bot started")
             
         except Exception as e:
@@ -605,11 +623,13 @@ class ArbitrageBotApp(App):
             elif self.simulator:
                 await self.simulator.stop()
             
-            # Disconnect from exchanges
+            # Disconnect from exchanges and close sessions
             for exchange in self.exchanges.values():
                 await exchange.disconnect_ws()
+                if hasattr(exchange, 'session') and exchange.session and not exchange.session.closed:
+                    await exchange.session.close()
             
-            self.is_running = False
+            self.trading_active = False
             logger.info("Trading bot stopped")
             
         except Exception as e:
@@ -618,7 +638,7 @@ class ArbitrageBotApp(App):
     async def action_reset(self):
         """Reset the bot state"""
         try:
-            if self.is_running:
+            if self.trading_active:
                 await self._stop_bot()
             
             # Reset simulator if using simulation mode
@@ -700,14 +720,48 @@ class ArbitrageBotApp(App):
     
     async def on_unmount(self) -> None:
         """Called when app shuts down"""
-        if self.update_task:
-            self.update_task.cancel()
-        
-        if self.is_running:
-            await self._stop_bot()
+        try:
+            if self.update_task:
+                self.update_task.cancel()
+            
+            if self.trading_active:
+                await self._stop_bot()
+            
+            # Ensure all exchanges are properly cleaned up
+            await self._cleanup_exchanges()
+            
+        except Exception as e:
+            logger.error(f"Error during app unmount: {e}")
+    
+    async def _cleanup_exchanges(self):
+        """Clean up all exchange resources"""
+        logger.info(f"Starting cleanup of {len(self.exchanges)} exchanges")
+        for exchange_name, exchange in self.exchanges.items():
+            try:
+                logger.info(f"Cleaning up exchange: {exchange_name}")
+                # Close WebSocket connections
+                await exchange.disconnect_ws()
+                # Close HTTP sessions
+                if hasattr(exchange, 'session') and exchange.session and not exchange.session.closed:
+                    await exchange.session.close()
+                    logger.info(f"Closed session for {exchange_name}")
+            except Exception as e:
+                logger.error(f"Error cleaning up exchange {exchange_name}: {e}")
+        logger.info("Exchange cleanup completed")
 
 
-def run_ui(config: Config, database: Database):
+async def run_ui(config: Config, database: Database):
     """Run the Textual UI"""
     app = ArbitrageBotApp(config, database)
-    app.run()
+    try:
+        logger.info("Starting Textual UI application")
+        await app.run_async()
+        logger.info("Textual UI application finished normally")
+    except Exception as e:
+        logger.error(f"Error in UI app: {e}")
+        import traceback
+        logger.error(f"UI app traceback: {traceback.format_exc()}")
+    finally:
+        logger.info("Running UI cleanup")
+        # Ensure cleanup happens even if the app exits unexpectedly
+        await app._cleanup_exchanges()

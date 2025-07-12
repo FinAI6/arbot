@@ -1,0 +1,2130 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import asyncio
+import threading
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+import logging
+from collections import deque
+import statistics
+
+from .config import Config, TradingMode
+from .database import Database
+from .strategy import ArbitrageStrategy, ArbitrageSignal
+from .trader import LiveTrader
+from .simulator import TradingSimulator
+from .backtester import Backtester
+from .exchanges import BinanceExchange, BybitExchange
+
+logger = logging.getLogger(__name__)
+
+
+class MovingAverageManager:
+    """Manages moving averages for symbol prices"""
+    
+    def __init__(self, periods: int = 30):
+        self.periods = periods
+        self.price_history: Dict[str, deque] = {}  # symbol -> price history
+        self.last_update: Dict[str, float] = {}   # symbol -> last update time
+    
+    def update_price(self, symbol: str, price: float, timestamp: float = None):
+        """Update price and calculate moving average"""
+        if timestamp is None:
+            timestamp = time.time()
+        
+        if symbol not in self.price_history:
+            self.price_history[symbol] = deque(maxlen=self.periods)
+            self.last_update[symbol] = timestamp
+        
+        # Add price with timestamp
+        self.price_history[symbol].append((price, timestamp))
+        self.last_update[symbol] = timestamp
+    
+    def get_moving_average(self, symbol: str) -> Optional[float]:
+        """Get current moving average for symbol"""
+        if symbol not in self.price_history or len(self.price_history[symbol]) == 0:
+            return None
+        
+        # Get only prices (ignore timestamps)
+        prices = [price for price, _ in self.price_history[symbol]]
+        return statistics.mean(prices) if prices else None
+    
+    def get_price_trend(self, symbol: str, threshold: float = 0.001) -> str:
+        """Get price trend indicator with configurable threshold"""
+        if symbol not in self.price_history or len(self.price_history[symbol]) < 2:
+            return "→"  # Neutral
+        
+        recent_prices = list(self.price_history[symbol])
+        if len(recent_prices) < 2:
+            return "→"
+        
+        first_half = recent_prices[:len(recent_prices)//2]
+        second_half = recent_prices[len(recent_prices)//2:]
+        
+        if not first_half or not second_half:
+            return "→"
+        
+        avg_first = statistics.mean([p for p, _ in first_half])
+        avg_second = statistics.mean([p for p, _ in second_half])
+        
+        change_pct = (avg_second - avg_first) / avg_first
+        
+        if change_pct > threshold:  # Configurable threshold
+            return "↗"  # Up trend
+        elif change_pct < -threshold:  # Configurable threshold
+            return "↘"  # Down trend
+        else:
+            return "→"  # Neutral
+    
+    def is_uptrend(self, symbol: str, threshold: float = 0.001) -> bool:
+        """Check if symbol is in uptrend"""
+        return self.get_price_trend(symbol, threshold) == "↗"
+    
+    def is_downtrend(self, symbol: str, threshold: float = 0.001) -> bool:
+        """Check if symbol is in downtrend"""
+        return self.get_price_trend(symbol, threshold) == "↘"
+    
+    def get_trend_strength(self, symbol: str) -> float:
+        """Get trend strength as percentage change"""
+        if symbol not in self.price_history or len(self.price_history[symbol]) < 2:
+            return 0.0
+        
+        recent_prices = list(self.price_history[symbol])
+        if len(recent_prices) < 2:
+            return 0.0
+        
+        first_half = recent_prices[:len(recent_prices)//2]
+        second_half = recent_prices[len(recent_prices)//2:]
+        
+        if not first_half or not second_half:
+            return 0.0
+        
+        avg_first = statistics.mean([p for p, _ in first_half])
+        avg_second = statistics.mean([p for p, _ in second_half])
+        
+        return (avg_second - avg_first) / avg_first
+
+
+class ArBotGUI:
+    def __init__(self, config: Config, database: Database):
+        self.config = config
+        self.database = database
+        self.exchanges = {}
+        self.strategy = None
+        self.trader = None
+        self.simulator = None
+        self.backtester = None
+        
+        # UI state
+        self.trading_active = False
+        self.last_update = 0
+        self.dynamic_symbols = []  # Will store the symbols to monitor
+        
+        # Data for widgets
+        self.recent_trades = []
+        self.current_opportunities = []
+        self.current_balances = {}
+        self.current_prices = {}
+        self.current_spreads = {}
+        
+        # Moving average manager
+        ma_periods = getattr(self.config.arbitrage, 'moving_average_periods', 30)
+        self.moving_average_manager = MovingAverageManager(ma_periods)
+        
+        # Sorting state for price tree
+        self.price_sort_column = "Spread %"  # Default sort column
+        self.price_sort_reverse = True  # Default to descending for Spread %
+        self.arbitrage_data = []  # Store data for sorting
+        
+        # Threading
+        self.update_thread = None
+        self.event_loop = None
+        self.stop_event = threading.Event()
+        
+        # Create the main window
+        self.root = tk.Tk()
+        self.root.title("ArBot - Arbitrage Trading Bot")
+        self.root.geometry("1200x800")
+        self.root.configure(bg='#2b2b2b')
+        
+        # Create the UI
+        self.create_widgets()
+        
+        # Start async loop in separate thread
+        self.start_async_loop()
+        
+        # Initialize components
+        self.root.after(100, self.initialize_components)
+    
+    def _get_quote_currency(self, symbol: str) -> str:
+        """Extract quote currency from symbol (e.g., BTCUSDT -> USDT)"""
+        # Try common quote currencies in order of priority (longest first to avoid conflicts)
+        sorted_quotes = sorted(self.config.arbitrage.available_quote_currencies, key=len, reverse=True)
+        for quote in sorted_quotes:
+            if symbol.endswith(quote):
+                return quote
+        
+        # Additional fallback patterns for edge cases
+        common_patterns = ['USDT', 'BUSD', 'USDC', 'BTC', 'ETH', 'BNB', 'USD', 'EUR']
+        for pattern in common_patterns:
+            if symbol.endswith(pattern):
+                return pattern
+        
+        return "UNKNOWN"
+    
+    def _is_symbol_enabled(self, symbol: str) -> bool:
+        """Check if symbol's quote currency is enabled"""
+        quote_currency = self._get_quote_currency(symbol)
+        return quote_currency in self.config.arbitrage.enabled_quote_currencies
+    
+    def sort_price_tree(self, column):
+        """Sort price tree by column"""
+        # Toggle sort order if same column, otherwise default to ascending
+        if column == self.price_sort_column:
+            self.price_sort_reverse = not self.price_sort_reverse
+        else:
+            self.price_sort_column = column
+            # Default sort order based on column type
+            if column == "Spread %":
+                self.price_sort_reverse = True  # Spread % defaults to descending
+            else:
+                self.price_sort_reverse = False  # Others default to ascending
+        
+        # Update column headers with sort indicators
+        self.update_column_headers()
+        
+        # Re-display data with new sort order
+        self.display_arbitrage_data()
+    
+    def update_column_headers(self):
+        """Update column headers with sort indicators"""
+        price_columns = ('Symbol', 'Higher Exchange', 'Price(±Diff)', 'MA30s', 'Trend', 'Spread %')
+        
+        for col in price_columns:
+            if col == self.price_sort_column:
+                # Add sort indicator
+                indicator = " ↓" if self.price_sort_reverse else " ↑"
+                header_text = col + indicator
+            else:
+                header_text = col
+            
+            self.price_tree.heading(col, text=header_text)
+    
+    def get_sort_key(self, row_data, column):
+        """Get sort key for a row based on column"""
+        try:
+            if column == "Symbol":
+                return row_data['symbol'].lower()
+            elif column == "Higher Exchange":
+                return row_data['higher_exchange'].lower()
+            elif column == "Price(±Diff)":
+                return row_data['higher_price']
+            elif column == "MA30s":
+                # Get moving average for higher exchange
+                higher_exchange_key = row_data['exchange1'] if row_data['higher_exchange'] == row_data['exchange1'].upper() else row_data['exchange2']
+                ma_value = row_data['ma1'] if row_data['higher_exchange'] == row_data['exchange1'].upper() else row_data['ma2']
+                return ma_value if ma_value is not None else 0
+            elif column == "Trend":
+                # Sort by trend: ↗ (1), → (0), ↘ (-1)
+                trend = row_data['trend1'] if row_data['higher_exchange'] == row_data['exchange1'].upper() else row_data['trend2']
+                trend_order = {"↗": 1, "→": 0, "↘": -1}
+                return trend_order.get(trend, 0)
+            elif column == "Spread %":
+                return row_data['spread_pct']
+            else:
+                return 0
+        except (KeyError, TypeError):
+            return 0
+    
+    def display_arbitrage_data(self):
+        """Display arbitrage data with current sort order"""
+        # Clear existing items
+        for item in self.price_tree.get_children():
+            self.price_tree.delete(item)
+        
+        if not self.arbitrage_data:
+            return
+        
+        # Sort data based on current sort settings
+        sorted_data = sorted(
+            self.arbitrage_data,
+            key=lambda row: self.get_sort_key(row, self.price_sort_column),
+            reverse=self.price_sort_reverse
+        )
+        
+        # Display sorted data
+        for row in sorted_data:
+            spread_pct = row['spread_pct']
+            min_profit_threshold = self.config.arbitrage.min_profit_threshold * 100
+            
+            # Check if this is an anomalous spread
+            is_anomalous = spread_pct >= 200.0
+            
+            # Color coding
+            if is_anomalous:
+                tag = "anomalous_spread"
+            elif spread_pct >= min_profit_threshold * 2:
+                tag = "high_profitable"
+            elif spread_pct >= min_profit_threshold:
+                tag = "profitable_arbitrage"
+            elif spread_pct >= min_profit_threshold * 0.5:
+                tag = "small_arbitrage"
+            else:
+                tag = "neutral_spread"
+            
+            # Format display data
+            symbol_display = row['symbol']
+            if is_anomalous:
+                symbol_display += " ⚠️"
+            
+            higher_exchange = row['higher_exchange']
+            higher_price = row['higher_price']
+            price_diff = row['price_diff']
+            
+            # Format price with difference
+            price_display = f"{higher_price:.6f} (+{price_diff:.6f})"
+            
+            # Get moving average for the higher exchange
+            ma_value = row['ma1'] if row['higher_exchange'] == row['exchange1'].upper() else row['ma2']
+            ma_display = f"{ma_value:.6f}" if ma_value else "N/A"
+            
+            # Get trend for the higher exchange
+            trend = row['trend1'] if row['higher_exchange'] == row['exchange1'].upper() else row['trend2']
+            
+            spread_display = f"{spread_pct:.3f}%"
+            
+            self.price_tree.insert('', 'end', values=(
+                symbol_display,
+                higher_exchange,
+                price_display,
+                ma_display,
+                trend,
+                spread_display
+            ), tags=(tag,))
+        
+        # Configure tags for color coding
+        self.price_tree.tag_configure("anomalous_spread", background="#8B0000", foreground="white")
+        self.price_tree.tag_configure("high_profitable", background="#006400", foreground="lightgreen")
+        self.price_tree.tag_configure("profitable_arbitrage", background="#2d5a2d", foreground="lightgreen")
+        self.price_tree.tag_configure("small_arbitrage", background="#4d4d2d", foreground="yellow")
+        self.price_tree.tag_configure("neutral_spread", background="#2d2d2d", foreground="white")
+    
+    def create_widgets(self):
+        """Create the main UI widgets"""
+        # Configure style
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Title.TLabel', font=('Arial', 12, 'bold'))
+        style.configure('Status.TLabel', font=('Arial', 10))
+        style.configure('Data.TLabel', font=('Consolas', 9))
+        style.configure('Accent.TButton', font=('Arial', 10, 'bold'))
+        
+        # Dark theme colors
+        style.configure('Treeview', background='#404040', foreground='white', 
+                       fieldbackground='#404040', borderwidth=0)
+        style.configure('Treeview.Heading', background='#505050', foreground='white',
+                       font=('Arial', 10, 'bold'))
+        
+        # Main container
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+        
+        # Create sections
+        self.create_header(main_frame)
+        self.create_main_content(main_frame)
+        self.create_controls(main_frame)
+        self.create_log_panel(main_frame)
+    
+    def create_header(self, parent):
+        """Create header with status information"""
+        header_frame = ttk.LabelFrame(parent, text="Status", padding="5")
+        header_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # Status labels
+        self.status_label = ttk.Label(header_frame, text="● STOPPED", 
+                                     foreground="red", style='Title.TLabel')
+        self.status_label.grid(row=0, column=0, padx=(0, 20))
+        
+        self.mode_label = ttk.Label(header_frame, text=f"Mode: {self.config.trading_mode.value}")
+        self.mode_label.grid(row=0, column=1, padx=(0, 20))
+        
+        self.exchanges_label = ttk.Label(header_frame, text="Exchanges: -")
+        self.exchanges_label.grid(row=0, column=2, padx=(0, 20))
+        
+        self.profit_label = ttk.Label(header_frame, text="Profit: $0.00", style='Title.TLabel')
+        self.profit_label.grid(row=0, column=3, padx=(0, 20))
+        
+        self.last_update_label = ttk.Label(header_frame, text="Last Update: -")
+        self.last_update_label.grid(row=0, column=4)
+    
+    def create_main_content(self, parent):
+        """Create main content area with prices and opportunities"""
+        content_frame = ttk.Frame(parent)
+        content_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        content_frame.columnconfigure(0, weight=1)
+        content_frame.columnconfigure(1, weight=1)
+        content_frame.rowconfigure(0, weight=1)
+        
+        # Left panel - Arbitrage Spreads
+        left_panel = ttk.LabelFrame(content_frame, text="Arbitrage Spreads (Exchange-to-Exchange)", padding="5")
+        left_panel.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
+        
+        # Price tree - now shows arbitrage spreads with moving averages
+        price_columns = ('Symbol', 'Higher Exchange', 'Price(±Diff)', 'MA30s', 'Trend', 'Spread %')
+        self.price_tree = ttk.Treeview(left_panel, columns=price_columns, show='headings', height=15)
+        
+        for col in price_columns:
+            # Add click handler for column sorting
+            self.price_tree.heading(col, text=col, command=lambda c=col: self.sort_price_tree(c))
+            self.price_tree.column(col, width=100)
+        
+        # Set initial column header with sort indicator
+        self.update_column_headers()
+        
+        price_scrollbar = ttk.Scrollbar(left_panel, orient=tk.VERTICAL, command=self.price_tree.yview)
+        self.price_tree.configure(yscrollcommand=price_scrollbar.set)
+        
+        self.price_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        price_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        left_panel.columnconfigure(0, weight=1)
+        left_panel.rowconfigure(0, weight=1)
+        
+        # Right panel - Opportunities and Trades
+        right_panel = ttk.Frame(content_frame)
+        right_panel.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
+        right_panel.columnconfigure(0, weight=1)
+        right_panel.rowconfigure(0, weight=1)
+        right_panel.rowconfigure(1, weight=1)
+        
+        # Opportunities
+        opp_frame = ttk.LabelFrame(right_panel, text="Arbitrage Opportunities", padding="5")
+        opp_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
+        
+        opp_columns = ('Symbol', 'Buy From', 'Sell To', 'Profit %', 'Amount')
+        self.opp_tree = ttk.Treeview(opp_frame, columns=opp_columns, show='headings', height=8)
+        
+        for col in opp_columns:
+            self.opp_tree.heading(col, text=col)
+            self.opp_tree.column(col, width=80)
+        
+        opp_scrollbar = ttk.Scrollbar(opp_frame, orient=tk.VERTICAL, command=self.opp_tree.yview)
+        self.opp_tree.configure(yscrollcommand=opp_scrollbar.set)
+        
+        self.opp_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        opp_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        opp_frame.columnconfigure(0, weight=1)
+        opp_frame.rowconfigure(0, weight=1)
+        
+        # Trades
+        trades_frame = ttk.LabelFrame(right_panel, text="Recent Trades", padding="5")
+        trades_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 0))
+        
+        trade_columns = ('Time', 'Symbol', 'Type', 'Amount', 'Profit')
+        self.trades_tree = ttk.Treeview(trades_frame, columns=trade_columns, show='headings', height=8)
+        
+        for col in trade_columns:
+            self.trades_tree.heading(col, text=col)
+            self.trades_tree.column(col, width=80)
+        
+        trades_scrollbar = ttk.Scrollbar(trades_frame, orient=tk.VERTICAL, command=self.trades_tree.yview)
+        self.trades_tree.configure(yscrollcommand=trades_scrollbar.set)
+        
+        self.trades_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        trades_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        trades_frame.columnconfigure(0, weight=1)
+        trades_frame.rowconfigure(0, weight=1)
+    
+    def create_controls(self, parent):
+        """Create control buttons and settings"""
+        controls_frame = ttk.LabelFrame(parent, text="Controls & Settings", padding="5")
+        controls_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # Trading controls
+        self.start_button = ttk.Button(controls_frame, text="Start Trading", 
+                                      command=self.toggle_trading, style='Accent.TButton')
+        self.start_button.grid(row=0, column=0, padx=(0, 10))
+        
+        self.reset_button = ttk.Button(controls_frame, text="Reset", command=self.reset_bot)
+        self.reset_button.grid(row=0, column=1, padx=(0, 10))
+        
+        # Settings button
+        settings_btn = ttk.Button(controls_frame, text="Settings", command=self.open_settings)
+        settings_btn.grid(row=0, column=2, padx=(20, 10))
+        
+        # Quick settings
+        ttk.Label(controls_frame, text="Trade Amount:").grid(row=0, column=3, padx=(20, 5))
+        self.amount_var = tk.StringVar(value=str(self.config.arbitrage.trade_amount_usd))
+        amount_entry = ttk.Entry(controls_frame, textvariable=self.amount_var, width=10)
+        amount_entry.grid(row=0, column=4, padx=(0, 20))
+        amount_entry.bind('<Return>', self.update_settings)
+        
+        ttk.Label(controls_frame, text="Min Profit %:").grid(row=0, column=5, padx=(20, 5))
+        self.min_profit_var = tk.StringVar(value=str(self.config.arbitrage.min_profit_threshold * 100))
+        profit_entry = ttk.Entry(controls_frame, textvariable=self.min_profit_var, width=10)
+        profit_entry.grid(row=0, column=6, padx=(0, 20))
+        profit_entry.bind('<Return>', self.update_settings)
+        
+        update_settings_btn = ttk.Button(controls_frame, text="Apply", 
+                                        command=self.update_settings)
+        update_settings_btn.grid(row=0, column=7, padx=(10, 0))
+    
+    def create_log_panel(self, parent):
+        """Create log display panel"""
+        log_frame = ttk.LabelFrame(parent, text="Logs", padding="5")
+        log_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state=tk.DISABLED,
+                                                 bg='#1e1e1e', fg='#ffffff', font=('Consolas', 9))
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Setup logging handler
+        log_handler = GUILogHandler(self.log_text)
+        log_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        log_handler.setFormatter(formatter)
+        logger.addHandler(log_handler)
+    
+    def start_async_loop(self):
+        """Start asyncio event loop in separate thread"""
+        def run_async_loop():
+            self.event_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.event_loop)
+            self.event_loop.run_forever()
+        
+        self.async_thread = threading.Thread(target=run_async_loop, daemon=True)
+        self.async_thread.start()
+    
+    def run_async(self, coro):
+        """Run async function in the event loop"""
+        if self.event_loop:
+            future = asyncio.run_coroutine_threadsafe(coro, self.event_loop)
+            return future
+    
+    def initialize_components(self):
+        """Initialize trading components"""
+        self.run_async(self._initialize_components_async())
+        # Start update loop
+        self.update_ui()
+    
+    async def _initialize_components_async(self):
+        """Async component initialization"""
+        try:
+            logger.info("Starting GUI component initialization")
+            
+            # Initialize database
+            await self.database.initialize()
+            
+            # Initialize exchanges
+            for exchange_name, exchange_config in self.config.exchanges.items():
+                if not exchange_config.enabled:
+                    continue
+                
+                if exchange_name == 'binance':
+                    exchange = BinanceExchange(
+                        exchange_config.api_key,
+                        exchange_config.api_secret,
+                        exchange_config.testnet
+                    )
+                elif exchange_name == 'bybit':
+                    exchange = BybitExchange(
+                        exchange_config.api_key,
+                        exchange_config.api_secret,
+                        exchange_config.testnet
+                    )
+                else:
+                    continue
+                
+                self.exchanges[exchange_name] = exchange
+                logger.info(f"Created exchange: {exchange_name}")
+            
+            # Update UI
+            self.root.after(0, self.update_status_display)
+            
+            # Initialize strategy
+            self.strategy = ArbitrageStrategy(self.config, self.database)
+            await self.strategy.initialize(self.exchanges)
+            self.strategy.add_signal_callback(self._on_arbitrage_signal)
+            
+            # Initialize trader/simulator
+            if self.config.trading_mode == TradingMode.LIVE:
+                self.trader = LiveTrader(self.config, self.database)
+                await self.trader.initialize(self.exchanges)
+            else:
+                self.simulator = TradingSimulator(self.config, self.database)
+            
+            # Initialize backtester
+            self.backtester = Backtester(self.config, self.database)
+            
+            # Get dynamic symbols if enabled
+            if self.config.arbitrage.use_dynamic_symbols:
+                logger.info("Getting dynamic symbols with volume data")
+                self.dynamic_symbols = await self.get_common_symbols_with_volume()
+            else:
+                self.dynamic_symbols = self.config.arbitrage.symbols
+                logger.info(f"Using configured symbols: {len(self.dynamic_symbols)} symbols")
+            
+            logger.info(f"Monitoring {len(self.dynamic_symbols)} symbols: {self.dynamic_symbols[:10]}...")
+            
+            logger.info("GUI component initialization completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize components: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+    
+    def toggle_trading(self):
+        """Toggle trading on/off"""
+        if self.trading_active:
+            self.run_async(self._stop_trading())
+        else:
+            self.run_async(self._start_trading())
+    
+    async def _start_trading(self):
+        """Start trading"""
+        try:
+            if not self.strategy:
+                logger.error("Strategy not initialized")
+                return
+            
+            # Update strategy with dynamic symbols
+            self.strategy.set_active_symbols(self.dynamic_symbols)
+            
+            await self.strategy.start()
+            
+            if self.config.trading_mode == TradingMode.LIVE and self.trader:
+                await self.trader.start()
+            elif self.simulator:
+                await self.simulator.start()
+            
+            # Connect to exchanges with dynamic symbols
+            # Use configured max symbols for comprehensive monitoring
+            max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+            symbols_to_monitor = self.dynamic_symbols[:max_symbols] if self.dynamic_symbols else self.config.arbitrage.symbols
+            for exchange_name, exchange in self.exchanges.items():
+                await exchange.connect_ws(symbols_to_monitor)
+            
+            self.trading_active = True
+            logger.info("Trading started")
+            
+            # Update UI
+            self.root.after(0, self.update_status_display)
+            
+        except Exception as e:
+            logger.error(f"Failed to start trading: {e}")
+    
+    async def _stop_trading(self):
+        """Stop trading"""
+        try:
+            if self.strategy:
+                await self.strategy.stop()
+            
+            if self.trader:
+                await self.trader.stop()
+            elif self.simulator:
+                await self.simulator.stop()
+            
+            # Disconnect from exchanges
+            for exchange in self.exchanges.values():
+                await exchange.disconnect_ws()
+                if hasattr(exchange, 'session') and exchange.session and not exchange.session.closed:
+                    await exchange.session.close()
+            
+            self.trading_active = False
+            logger.info("Trading stopped")
+            
+            # Update UI
+            self.root.after(0, self.update_status_display)
+            
+        except Exception as e:
+            logger.error(f"Failed to stop trading: {e}")
+    
+    def reset_bot(self):
+        """Reset bot state"""
+        self.run_async(self._reset_bot_async())
+    
+    def update_settings(self, event=None):
+        """Update configuration settings"""
+        try:
+            # Update trade amount
+            new_amount = float(self.amount_var.get())
+            self.config.arbitrage.trade_amount_usd = new_amount
+            
+            # Update min profit threshold
+            new_profit_pct = float(self.min_profit_var.get())
+            self.config.arbitrage.min_profit_threshold = new_profit_pct / 100.0
+            
+            # Update strategy if it exists
+            if self.strategy:
+                self.strategy.config = self.config
+            
+            logger.info(f"Settings updated: Trade Amount=${new_amount}, Min Profit={new_profit_pct}%")
+            
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", "Please enter valid numeric values for settings.")
+            logger.error(f"Invalid settings input: {e}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update settings: {e}")
+            logger.error(f"Error updating settings: {e}")
+    
+    def open_settings(self):
+        """Open comprehensive settings dialog"""
+        settings_window = tk.Toplevel(self.root)
+        settings_window.title("ArBot Comprehensive Settings")
+        settings_window.geometry("700x700")
+        settings_window.configure(bg='#2b2b2b')
+        settings_window.transient(self.root)
+        settings_window.grab_set()
+        
+        # Initialize settings variables for saving BEFORE creating tabs
+        self.settings_vars = {}
+        
+        # Create notebook for tabbed interface
+        notebook = ttk.Notebook(settings_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Trading settings tab
+        trading_frame = ttk.Frame(notebook)
+        notebook.add(trading_frame, text="Trading")
+        self.create_trading_settings(trading_frame)
+        
+        # Exchange settings tab
+        exchange_frame = ttk.Frame(notebook)
+        notebook.add(exchange_frame, text="Exchanges")
+        self.create_exchange_settings(exchange_frame)
+        
+        # Risk Management tab
+        risk_frame = ttk.Frame(notebook)
+        notebook.add(risk_frame, text="Risk Management")
+        self.create_risk_settings(risk_frame)
+        
+        # Database settings tab
+        database_frame = ttk.Frame(notebook)
+        notebook.add(database_frame, text="Database")
+        self.create_database_settings(database_frame)
+        
+        # Backtest settings tab
+        backtest_frame = ttk.Frame(notebook)
+        notebook.add(backtest_frame, text="Backtest")
+        self.create_backtest_settings(backtest_frame)
+        
+        # General settings tab
+        general_frame = ttk.Frame(notebook)
+        notebook.add(general_frame, text="UI & General")
+        self.create_general_settings(general_frame)
+        
+        # Regional Premiums tab
+        regional_frame = ttk.Frame(notebook)
+        notebook.add(regional_frame, text="Regional Premiums")
+        self.create_regional_settings(regional_frame)
+        
+        # Buttons
+        button_frame = ttk.Frame(settings_window)
+        button_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        ttk.Button(button_frame, text="Save & Apply", 
+                  command=lambda: self.save_settings(settings_window)).pack(side=tk.RIGHT, padx=(10, 0))
+        ttk.Button(button_frame, text="Cancel", 
+                  command=settings_window.destroy).pack(side=tk.RIGHT)
+    
+    def create_trading_settings(self, parent):
+        """Create trading settings panel"""
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create canvas and scrollbar for scrolling (like exchange settings)
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Initialize row counter
+        row_cnt = 0
+        
+        try:
+            # Trading mode
+            ttk.Label(scrollable_frame, text="Trading Mode:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            mode_var = tk.StringVar(value=self.config.trading_mode.value)
+            mode_combo = ttk.Combobox(scrollable_frame, textvariable=mode_var, 
+                                     values=["simulation", "live"], state="readonly")
+            mode_combo.grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['trading_mode'] = mode_var
+            logger.info("Trading mode widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating trading mode widget: {e}")
+        
+        try:
+            # Trade amount
+            ttk.Label(scrollable_frame, text="Trade Amount (USD):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            amount_var = tk.StringVar(value=str(getattr(self.config.arbitrage, 'trade_amount_usd', 100.0)))
+            ttk.Entry(scrollable_frame, textvariable=amount_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['trade_amount_usd'] = amount_var
+            logger.info("Trade amount widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating trade amount widget: {e}")
+        
+        try:
+            # Min profit threshold
+            ttk.Label(scrollable_frame, text="Min Profit Threshold (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            profit_threshold = getattr(self.config.arbitrage, 'min_profit_threshold', 0.005) * 100
+            profit_var = tk.StringVar(value=str(profit_threshold))
+            ttk.Entry(scrollable_frame, textvariable=profit_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['min_profit_threshold'] = profit_var
+            logger.info("Min profit threshold widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating min profit threshold widget: {e}")
+        
+        try:
+            # Max position size
+            ttk.Label(scrollable_frame, text="Max Position Size (USD):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            pos_var = tk.StringVar(value=str(getattr(self.config.arbitrage, 'max_position_size', 1000.0)))
+            ttk.Entry(scrollable_frame, textvariable=pos_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['max_position_size'] = pos_var
+            logger.info("Max position size widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating max position size widget: {e}")
+        
+        try:
+            # Slippage tolerance
+            ttk.Label(scrollable_frame, text="Slippage Tolerance (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            slip_var = tk.StringVar(value=str(self.config.arbitrage.slippage_tolerance * 100))
+            ttk.Entry(scrollable_frame, textvariable=slip_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['slippage_tolerance'] = slip_var
+            logger.info("Slippage tolerance widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating slippage tolerance widget: {e}")
+        
+        try:
+            # Max spread age
+            ttk.Label(scrollable_frame, text="Max Spread Age (seconds):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            age_var = tk.StringVar(value=str(getattr(self.config.arbitrage, 'max_spread_age_seconds', 5.0)))
+            ttk.Entry(scrollable_frame, textvariable=age_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['max_spread_age_seconds'] = age_var
+            logger.info("Max spread age widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating max spread age widget: {e}")
+        
+        try:
+            # Max trades per hour
+            ttk.Label(scrollable_frame, text="Max Trades Per Hour:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            trades_var = tk.StringVar(value=str(getattr(self.config.arbitrage, 'max_trades_per_hour', 50)))
+            ttk.Entry(scrollable_frame, textvariable=trades_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['max_trades_per_hour'] = trades_var
+            logger.info("Max trades per hour widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating max trades per hour widget: {e}")
+        
+        try:
+            # Max spread threshold
+            ttk.Label(scrollable_frame, text="Max Spread Threshold (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            spread_threshold = getattr(self.config.arbitrage, 'max_spread_threshold', 2.0) * 100
+            spread_var = tk.StringVar(value=str(spread_threshold))
+            ttk.Entry(scrollable_frame, textvariable=spread_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['max_spread_threshold'] = spread_var
+            logger.info("Max spread threshold widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating max spread threshold widget: {e}")
+        
+        try:
+            # Max symbols
+            ttk.Label(scrollable_frame, text="Max Symbols to Monitor:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            max_symbols_var = tk.StringVar(value=str(getattr(self.config.arbitrage, 'max_symbols', 200)))
+            ttk.Entry(scrollable_frame, textvariable=max_symbols_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['max_symbols'] = max_symbols_var
+            logger.info("Max symbols widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating max symbols widget: {e}")
+        
+        try:
+            # Moving Average Periods
+            ttk.Label(scrollable_frame, text="Moving Average Periods (seconds):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            ma_periods_var = tk.StringVar(value=str(getattr(self.config.arbitrage, 'moving_average_periods', 30)))
+            ttk.Entry(scrollable_frame, textvariable=ma_periods_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['moving_average_periods'] = ma_periods_var
+            logger.info("Moving average periods widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating moving average periods widget: {e}")
+        
+        try:
+            # Use dynamic symbols
+            dynamic_var = tk.BooleanVar(value=getattr(self.config.arbitrage, 'use_dynamic_symbols', True))
+            ttk.Checkbutton(scrollable_frame, text="Use Dynamic Symbols (auto-detect high volume pairs)", 
+                           variable=dynamic_var).grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=10)
+            self.settings_vars['use_dynamic_symbols'] = dynamic_var
+            logger.info("Use dynamic symbols widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating use dynamic symbols widget: {e}")
+        
+        try:
+            # Quote Currency Settings Section
+            ttk.Label(scrollable_frame, text="Quote Currency Settings:", 
+                     style='Title.TLabel').grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=(20, 10))
+            logger.info("Quote currency section header created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating quote currency section header: {e}")
+        
+        # Add quote currency checkboxes
+        if not hasattr(self, 'quote_currency_vars'):
+            self.quote_currency_vars = {}
+        
+        enabled_currencies = getattr(self.config.arbitrage, 'enabled_quote_currencies', ["USDT"])
+        available_currencies = getattr(self.config.arbitrage, 'available_quote_currencies', ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"])
+        
+        try:
+            # Create checkboxes for each available quote currency
+            currency_row_start = row_cnt
+            for i, currency in enumerate(available_currencies):
+                if i % 3 == 0 and i > 0:  # New row every 3 currencies
+                    row_cnt += 1
+                
+                currency_var = tk.BooleanVar(value=currency in enabled_currencies)
+                ttk.Checkbutton(scrollable_frame, text=currency, 
+                               variable=currency_var).grid(row=row_cnt, column=i % 3, sticky=tk.W, padx=(0, 20), pady=5)
+                self.quote_currency_vars[currency] = currency_var
+            
+            row_cnt += 1  # Move to next row after currencies
+            logger.info("Quote currency checkboxes created successfully")
+        except Exception as e:
+            logger.error(f"Error creating quote currency checkboxes: {e}")
+        
+        try:
+            # Premium Detection Section
+            row_cnt += 1  # Add some space
+            ttk.Label(scrollable_frame, text="Premium Detection Settings:", 
+                     style='Title.TLabel').grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=(20, 10))
+            logger.info("Premium detection section header created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating premium detection section header: {e}")
+        
+        try:
+            # Premium detection enabled
+            premium_detection_config = getattr(self.config.arbitrage, 'premium_detection', None)
+            if premium_detection_config:
+                enabled = getattr(premium_detection_config, 'enabled', True)
+            else:
+                enabled = True
+            premium_enabled_var = tk.BooleanVar(value=enabled)
+            ttk.Checkbutton(scrollable_frame, text="Enable Premium Detection", 
+                           variable=premium_enabled_var).grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=5)
+            self.settings_vars['premium_detection_enabled'] = premium_enabled_var
+            logger.info("Premium detection enabled widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating premium detection enabled widget: {e}")
+        
+        try:
+            # Lookback periods
+            ttk.Label(scrollable_frame, text="Lookback Periods:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            if premium_detection_config:
+                lookback_periods = getattr(premium_detection_config, 'lookback_periods', 100)
+            else:
+                lookback_periods = 100
+            lookback_var = tk.StringVar(value=str(lookback_periods))
+            ttk.Entry(scrollable_frame, textvariable=lookback_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['premium_detection_lookback_periods'] = lookback_var
+            logger.info("Lookback periods widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating lookback periods widget: {e}")
+        
+        try:
+            # Min samples
+            ttk.Label(scrollable_frame, text="Min Samples:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            if premium_detection_config:
+                min_samples = getattr(premium_detection_config, 'min_samples', 50)
+            else:
+                min_samples = 50
+            min_samples_var = tk.StringVar(value=str(min_samples))
+            ttk.Entry(scrollable_frame, textvariable=min_samples_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['premium_detection_min_samples'] = min_samples_var
+            logger.info("Min samples widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating min samples widget: {e}")
+        
+        try:
+            # Outlier threshold
+            ttk.Label(scrollable_frame, text="Outlier Threshold:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            if premium_detection_config:
+                outlier_threshold = getattr(premium_detection_config, 'outlier_threshold', 2.0)
+            else:
+                outlier_threshold = 2.0
+            outlier_var = tk.StringVar(value=str(outlier_threshold))
+            ttk.Entry(scrollable_frame, textvariable=outlier_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+            self.settings_vars['premium_detection_outlier_threshold'] = outlier_var
+            logger.info("Outlier threshold widget created successfully")
+            row_cnt += 1
+        except Exception as e:
+            logger.error(f"Error creating outlier threshold widget: {e}")
+        
+        # Configure column weights for scrollable frame
+        scrollable_frame.columnconfigure(1, weight=1)
+        
+        logger.info("Trading settings panel creation completed")
+    
+    def create_exchange_settings(self, parent):
+        """Create exchange settings panel"""
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create canvas and scrollbar for scrolling
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        ttk.Label(scrollable_frame, text="Exchange Configuration:", 
+                 style='Title.TLabel').grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 10))
+        
+        self.exchange_vars = {}
+        self.exchange_api_vars = {}
+        row = 1
+        
+        for exchange_name, exchange_config in self.config.exchanges.items():
+            # Exchange name and enabled checkbox
+            enabled_var = tk.BooleanVar(value=exchange_config.enabled)
+            ttk.Checkbutton(scrollable_frame, text=f"{exchange_name.upper()} Enabled", 
+                           variable=enabled_var).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=5)
+            self.exchange_vars[exchange_name] = {
+                'enabled': enabled_var
+            }
+            row += 1
+            
+            # API Key
+            ttk.Label(scrollable_frame, text=f"{exchange_name.upper()} API Key:").grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+            api_key_var = tk.StringVar(value=exchange_config.api_key or "")
+            api_key_entry = ttk.Entry(scrollable_frame, textvariable=api_key_var, show="*", width=40)
+            api_key_entry.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=(5, 0))
+            self.exchange_vars[exchange_name]['api_key'] = api_key_var
+            row += 1
+            
+            # API Secret
+            ttk.Label(scrollable_frame, text=f"{exchange_name.upper()} API Secret:").grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+            api_secret_var = tk.StringVar(value=exchange_config.api_secret or "")
+            api_secret_entry = ttk.Entry(scrollable_frame, textvariable=api_secret_var, show="*", width=40)
+            api_secret_entry.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=(5, 0))
+            self.exchange_vars[exchange_name]['api_secret'] = api_secret_var
+            row += 1
+            
+            # Testnet checkbox
+            testnet_var = tk.BooleanVar(value=exchange_config.testnet)
+            ttk.Checkbutton(scrollable_frame, text=f"{exchange_name.upper()} Use Testnet", 
+                           variable=testnet_var).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=(20, 0), pady=2)
+            self.exchange_vars[exchange_name]['testnet'] = testnet_var
+            row += 1
+            
+            # Arbitrage enabled
+            arb_var = tk.BooleanVar(value=exchange_config.arbitrage_enabled)
+            ttk.Checkbutton(scrollable_frame, text=f"{exchange_name.upper()} Arbitrage Enabled", 
+                           variable=arb_var).grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=(20, 0), pady=2)
+            self.exchange_vars[exchange_name]['arbitrage_enabled'] = arb_var
+            row += 1
+            
+            # Region
+            ttk.Label(scrollable_frame, text=f"{exchange_name.upper()} Region:").grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+            region_var = tk.StringVar(value=exchange_config.region)
+            region_combo = ttk.Combobox(scrollable_frame, textvariable=region_var, 
+                                       values=["global", "korea", "japan", "us"], state="readonly", width=15)
+            region_combo.grid(row=row, column=1, sticky=tk.W, padx=(5, 0))
+            self.exchange_vars[exchange_name]['region'] = region_var
+            row += 1
+            
+            # Premium baseline
+            ttk.Label(scrollable_frame, text=f"{exchange_name.upper()} Premium Baseline (%):").grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+            premium_var = tk.StringVar(value=str(exchange_config.premium_baseline))
+            ttk.Entry(scrollable_frame, textvariable=premium_var, width=15).grid(row=row, column=1, sticky=tk.W, padx=(5, 0))
+            self.exchange_vars[exchange_name]['premium_baseline'] = premium_var
+            row += 1
+            
+            # Separator
+            ttk.Separator(scrollable_frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
+            row += 1
+        
+        scrollable_frame.columnconfigure(1, weight=1)
+    
+    def create_risk_settings(self, parent):
+        """Create risk management settings panel"""
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize row counter
+        row_cnt = 0
+        
+        ttk.Label(main_frame, text="Risk Management Configuration:", 
+                 style='Title.TLabel').grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        row_cnt += 1
+        
+        # Max drawdown
+        ttk.Label(main_frame, text="Max Drawdown (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        drawdown_var = tk.StringVar(value=str(self.config.risk_management.max_drawdown_percent))
+        ttk.Entry(main_frame, textvariable=drawdown_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['max_drawdown_percent'] = drawdown_var
+        row_cnt += 1
+        
+        # Stop loss
+        ttk.Label(main_frame, text="Stop Loss (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        stop_loss_var = tk.StringVar(value=str(self.config.risk_management.stop_loss_percent))
+        ttk.Entry(main_frame, textvariable=stop_loss_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['stop_loss_percent'] = stop_loss_var
+        row_cnt += 1
+        
+        # Position sizing method
+        ttk.Label(main_frame, text="Position Sizing Method:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        sizing_var = tk.StringVar(value=self.config.risk_management.position_sizing_method)
+        sizing_combo = ttk.Combobox(main_frame, textvariable=sizing_var, 
+                                   values=["fixed", "kelly"], state="readonly")
+        sizing_combo.grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['position_sizing_method'] = sizing_var
+        row_cnt += 1
+        
+        # Max concurrent trades
+        ttk.Label(main_frame, text="Max Concurrent Trades:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        concurrent_var = tk.StringVar(value=str(self.config.risk_management.max_concurrent_trades))
+        ttk.Entry(main_frame, textvariable=concurrent_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['max_concurrent_trades'] = concurrent_var
+        row_cnt += 1
+        
+        # Balance threshold
+        ttk.Label(main_frame, text="Balance Threshold (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        balance_var = tk.StringVar(value=str(self.config.risk_management.balance_threshold_percent))
+        ttk.Entry(main_frame, textvariable=balance_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['balance_threshold_percent'] = balance_var
+        row_cnt += 1
+        
+        main_frame.columnconfigure(1, weight=1)
+    
+    def create_database_settings(self, parent):
+        """Create database settings panel"""
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize row counter
+        row_cnt = 0
+        
+        ttk.Label(main_frame, text="Database Configuration:", 
+                 style='Title.TLabel').grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        row_cnt += 1
+        
+        # Database path
+        ttk.Label(main_frame, text="Database Path:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        db_path_var = tk.StringVar(value=self.config.database.db_path)
+        ttk.Entry(main_frame, textvariable=db_path_var, width=50).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['db_path'] = db_path_var
+        row_cnt += 1
+        
+        # Backup interval
+        ttk.Label(main_frame, text="Backup Interval (hours):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        backup_var = tk.StringVar(value=str(self.config.database.backup_interval_hours))
+        ttk.Entry(main_frame, textvariable=backup_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['backup_interval_hours'] = backup_var
+        row_cnt += 1
+        
+        # Max history days
+        ttk.Label(main_frame, text="Max History Days:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        history_var = tk.StringVar(value=str(self.config.database.max_history_days))
+        ttk.Entry(main_frame, textvariable=history_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['max_history_days'] = history_var
+        row_cnt += 1
+        
+        main_frame.columnconfigure(1, weight=1)
+    
+    def create_backtest_settings(self, parent):
+        """Create backtest settings panel"""
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize row counter
+        row_cnt = 0
+        
+        ttk.Label(main_frame, text="Backtest Configuration:", 
+                 style='Title.TLabel').grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        row_cnt += 1
+        
+        # Start date
+        ttk.Label(main_frame, text="Start Date (YYYY-MM-DD):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        start_date_var = tk.StringVar(value=self.config.backtest.start_date)
+        ttk.Entry(main_frame, textvariable=start_date_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['start_date'] = start_date_var
+        row_cnt += 1
+        
+        # End date
+        ttk.Label(main_frame, text="End Date (YYYY-MM-DD):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        end_date_var = tk.StringVar(value=self.config.backtest.end_date)
+        ttk.Entry(main_frame, textvariable=end_date_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['end_date'] = end_date_var
+        row_cnt += 1
+        
+        # Initial balance
+        ttk.Label(main_frame, text="Initial Balance (USD):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        balance_var = tk.StringVar(value=str(self.config.backtest.initial_balance))
+        ttk.Entry(main_frame, textvariable=balance_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['initial_balance'] = balance_var
+        row_cnt += 1
+        
+        # Data source
+        ttk.Label(main_frame, text="Data Source:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        source_var = tk.StringVar(value=self.config.backtest.data_source)
+        source_combo = ttk.Combobox(main_frame, textvariable=source_var, 
+                                   values=["database", "csv"], state="readonly")
+        source_combo.grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['data_source'] = source_var
+        row_cnt += 1
+        
+        # CSV path
+        ttk.Label(main_frame, text="CSV Path (if using CSV):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        csv_var = tk.StringVar(value=self.config.backtest.csv_path or "")
+        ttk.Entry(main_frame, textvariable=csv_var, width=50).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['csv_path'] = csv_var
+        row_cnt += 1
+        
+        main_frame.columnconfigure(1, weight=1)
+    
+    def create_general_settings(self, parent):
+        """Create general settings panel"""
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize row counter
+        row_cnt = 0
+        
+        ttk.Label(main_frame, text="UI & General Configuration:", 
+                 style='Title.TLabel').grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        row_cnt += 1
+        
+        # UI refresh rate
+        ttk.Label(main_frame, text="UI Refresh Rate (ms):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        refresh_var = tk.StringVar(value=str(self.config.ui.refresh_rate_ms))
+        ttk.Entry(main_frame, textvariable=refresh_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['refresh_rate_ms'] = refresh_var
+        row_cnt += 1
+        
+        # Log level
+        ttk.Label(main_frame, text="Log Level:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        log_var = tk.StringVar(value=self.config.ui.log_level)
+        log_combo = ttk.Combobox(main_frame, textvariable=log_var, 
+                                values=["DEBUG", "INFO", "WARNING", "ERROR"], state="readonly")
+        log_combo.grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['log_level'] = log_var
+        row_cnt += 1
+        
+        # Enable notifications
+        notifications_var = tk.BooleanVar(value=self.config.ui.enable_notifications)
+        ttk.Checkbutton(main_frame, text="Enable Notifications", 
+                       variable=notifications_var).grid(row=row_cnt, column=0, columnspan=2, sticky=tk.W, pady=5)
+        self.settings_vars['enable_notifications'] = notifications_var
+        row_cnt += 1
+        
+        # Theme
+        ttk.Label(main_frame, text="Theme:").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+        theme_var = tk.StringVar(value=self.config.ui.theme)
+        theme_combo = ttk.Combobox(main_frame, textvariable=theme_var, 
+                                  values=["dark", "light"], state="readonly")
+        theme_combo.grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
+        self.settings_vars['theme'] = theme_var
+        row_cnt += 1
+        
+        main_frame.columnconfigure(1, weight=1)
+    
+    def create_regional_settings(self, parent):
+        """Create regional premiums settings panel"""
+        main_frame = ttk.Frame(parent, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Use standard fonts since all text is now in English
+        self.standard_font = ('Arial', 9)
+        self.standard_font_bold = ('Arial', 10, 'bold')
+        
+        # Create canvas and scrollbar for scrolling
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        tk.Label(scrollable_frame, text="Regional Premium Configuration:", 
+                 font=self.standard_font_bold).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+        
+        self.regional_vars = {}
+        row = 1
+        
+        for region_name, region_data in self.config.regional_premiums.items():
+            # Region header
+            tk.Label(scrollable_frame, text=f"{region_name.upper()} Region:", 
+                     font=self.standard_font_bold).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(10, 5))
+            row += 1
+            
+            # Description
+            tk.Label(scrollable_frame, text="Description:", font=self.standard_font).grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+            desc_var = tk.StringVar(value=region_data.get('description', ''))
+            desc_entry = tk.Entry(scrollable_frame, textvariable=desc_var, width=40, font=self.standard_font)
+            desc_entry.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=(5, 0))
+            
+            if region_name not in self.regional_vars:
+                self.regional_vars[region_name] = {}
+            self.regional_vars[region_name]['description'] = desc_var
+            row += 1
+            
+            # Typical premium
+            ttk.Label(scrollable_frame, text="Typical Premium (%):").grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+            premium_var = tk.StringVar(value=str(region_data.get('typical_premium_pct', 0.0)))
+            ttk.Entry(scrollable_frame, textvariable=premium_var, width=15).grid(row=row, column=1, sticky=tk.W, padx=(5, 0))
+            self.regional_vars[region_name]['typical_premium_pct'] = premium_var
+            row += 1
+            
+            # Exchanges
+            tk.Label(scrollable_frame, text="Exchanges (comma-separated):", font=self.standard_font).grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+            exchanges_str = ', '.join(region_data.get('exchanges', []))
+            exchanges_var = tk.StringVar(value=exchanges_str)
+            exchanges_entry = tk.Entry(scrollable_frame, textvariable=exchanges_var, width=40, font=self.standard_font)
+            exchanges_entry.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=(5, 0))
+            self.regional_vars[region_name]['exchanges'] = exchanges_var
+            row += 1
+            
+            # Separator
+            ttk.Separator(scrollable_frame, orient='horizontal').grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+            row += 1
+        
+        # Add new region section
+        tk.Label(scrollable_frame, text="Add New Region:", 
+                 font=self.standard_font_bold).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(20, 5))
+        row += 1
+        
+        tk.Label(scrollable_frame, text="Region Name:", font=self.standard_font).grid(row=row, column=0, sticky=tk.W, padx=(20, 5))
+        self.new_region_name_var = tk.StringVar()
+        new_region_entry = tk.Entry(scrollable_frame, textvariable=self.new_region_name_var, width=20, font=self.standard_font)
+        new_region_entry.grid(row=row, column=1, sticky=tk.W, padx=(5, 0))
+        
+        ttk.Button(scrollable_frame, text="Add Region", 
+                  command=self.add_new_region).grid(row=row, column=2, padx=(10, 0))
+        
+        scrollable_frame.columnconfigure(1, weight=1)
+    
+    def add_new_region(self):
+        """Add a new regional premium configuration"""
+        region_name = self.new_region_name_var.get().strip().lower()
+        if region_name and region_name not in self.config.regional_premiums:
+            self.config.regional_premiums[region_name] = {
+                "exchanges": [],
+                "typical_premium_pct": 0.0,
+                "description": f"{region_name.title()} region premium"
+            }
+            messagebox.showinfo("Success", f"Added new region: {region_name}")
+            self.new_region_name_var.set("")
+        else:
+            messagebox.showerror("Error", "Region name is empty or already exists")
+    
+    def save_settings(self, settings_window):
+        """Save settings to config.local.json"""
+        try:
+            import json
+            import os
+            
+            # Update config object
+            if 'trading_mode' in self.settings_vars:
+                mode_value = self.settings_vars['trading_mode'].get()
+                self.config.trading_mode = TradingMode(mode_value)
+            
+            if 'trade_amount_usd' in self.settings_vars:
+                self.config.arbitrage.trade_amount_usd = float(self.settings_vars['trade_amount_usd'].get())
+            
+            if 'min_profit_threshold' in self.settings_vars:
+                self.config.arbitrage.min_profit_threshold = float(self.settings_vars['min_profit_threshold'].get()) / 100.0
+            
+            if 'max_position_size' in self.settings_vars:
+                self.config.arbitrage.max_position_size = float(self.settings_vars['max_position_size'].get())
+            
+            if 'max_symbols' in self.settings_vars:
+                self.config.arbitrage.max_symbols = int(self.settings_vars['max_symbols'].get())
+            
+            # Update quote currency settings
+            if hasattr(self, 'quote_currency_vars'):
+                enabled_currencies = []
+                for currency, var in self.quote_currency_vars.items():
+                    if var.get():
+                        enabled_currencies.append(currency)
+                self.config.arbitrage.enabled_quote_currencies = enabled_currencies
+            
+            # Update moving average periods
+            if 'moving_average_periods' in self.settings_vars:
+                self.config.arbitrage.moving_average_periods = int(self.settings_vars['moving_average_periods'].get())
+            
+            if 'use_dynamic_symbols' in self.settings_vars:
+                self.config.arbitrage.use_dynamic_symbols = self.settings_vars['use_dynamic_symbols'].get()
+            
+            if 'refresh_rate_ms' in self.settings_vars:
+                self.config.ui.refresh_rate_ms = int(self.settings_vars['refresh_rate_ms'].get())
+            
+            if 'log_level' in self.settings_vars:
+                self.config.ui.log_level = self.settings_vars['log_level'].get()
+            
+            if 'enable_notifications' in self.settings_vars:
+                self.config.ui.enable_notifications = self.settings_vars['enable_notifications'].get()
+            
+            if 'theme' in self.settings_vars:
+                self.config.ui.theme = self.settings_vars['theme'].get()
+            
+            # Update arbitrage settings
+            if 'slippage_tolerance' in self.settings_vars:
+                self.config.arbitrage.slippage_tolerance = float(self.settings_vars['slippage_tolerance'].get()) / 100.0
+            
+            if 'max_spread_age_seconds' in self.settings_vars:
+                self.config.arbitrage.max_spread_age_seconds = float(self.settings_vars['max_spread_age_seconds'].get())
+            
+            if 'max_trades_per_hour' in self.settings_vars:
+                self.config.arbitrage.max_trades_per_hour = int(self.settings_vars['max_trades_per_hour'].get())
+            
+            if 'max_spread_threshold' in self.settings_vars:
+                self.config.arbitrage.max_spread_threshold = float(self.settings_vars['max_spread_threshold'].get()) / 100.0
+            
+            # Update premium detection settings
+            if 'premium_detection_enabled' in self.settings_vars:
+                self.config.arbitrage.premium_detection.enabled = self.settings_vars['premium_detection_enabled'].get()
+            
+            if 'premium_detection_lookback_periods' in self.settings_vars:
+                self.config.arbitrage.premium_detection.lookback_periods = int(self.settings_vars['premium_detection_lookback_periods'].get())
+            
+            if 'premium_detection_min_samples' in self.settings_vars:
+                self.config.arbitrage.premium_detection.min_samples = int(self.settings_vars['premium_detection_min_samples'].get())
+            
+            if 'premium_detection_outlier_threshold' in self.settings_vars:
+                self.config.arbitrage.premium_detection.outlier_threshold = float(self.settings_vars['premium_detection_outlier_threshold'].get())
+            
+            # Update exchange settings
+            if hasattr(self, 'exchange_vars'):
+                for exchange_name, vars_dict in self.exchange_vars.items():
+                    if exchange_name in self.config.exchanges:
+                        if 'enabled' in vars_dict:
+                            self.config.exchanges[exchange_name].enabled = vars_dict['enabled'].get()
+                        if 'testnet' in vars_dict:
+                            self.config.exchanges[exchange_name].testnet = vars_dict['testnet'].get()
+                        if 'arbitrage_enabled' in vars_dict:
+                            self.config.exchanges[exchange_name].arbitrage_enabled = vars_dict['arbitrage_enabled'].get()
+                        if 'region' in vars_dict:
+                            self.config.exchanges[exchange_name].region = vars_dict['region'].get()
+                        if 'premium_baseline' in vars_dict:
+                            self.config.exchanges[exchange_name].premium_baseline = float(vars_dict['premium_baseline'].get())
+            
+            # Update regional premiums
+            if hasattr(self, 'regional_vars'):
+                for region_name, vars_dict in self.regional_vars.items():
+                    if region_name in self.config.regional_premiums:
+                        if 'description' in vars_dict:
+                            self.config.regional_premiums[region_name]['description'] = vars_dict['description'].get()
+                        if 'typical_premium_pct' in vars_dict:
+                            self.config.regional_premiums[region_name]['typical_premium_pct'] = float(vars_dict['typical_premium_pct'].get())
+                        if 'exchanges' in vars_dict:
+                            exchanges_str = vars_dict['exchanges'].get()
+                            self.config.regional_premiums[region_name]['exchanges'] = [ex.strip() for ex in exchanges_str.split(',') if ex.strip()]
+            
+            # Update risk management settings
+            if 'max_drawdown_percent' in self.settings_vars:
+                self.config.risk_management.max_drawdown_percent = float(self.settings_vars['max_drawdown_percent'].get())
+            
+            if 'stop_loss_percent' in self.settings_vars:
+                self.config.risk_management.stop_loss_percent = float(self.settings_vars['stop_loss_percent'].get())
+            
+            if 'position_sizing_method' in self.settings_vars:
+                self.config.risk_management.position_sizing_method = self.settings_vars['position_sizing_method'].get()
+            
+            if 'max_concurrent_trades' in self.settings_vars:
+                self.config.risk_management.max_concurrent_trades = int(self.settings_vars['max_concurrent_trades'].get())
+            
+            if 'balance_threshold_percent' in self.settings_vars:
+                self.config.risk_management.balance_threshold_percent = float(self.settings_vars['balance_threshold_percent'].get())
+            
+            # Update database settings
+            if 'db_path' in self.settings_vars:
+                self.config.database.db_path = self.settings_vars['db_path'].get()
+            
+            if 'backup_interval_hours' in self.settings_vars:
+                self.config.database.backup_interval_hours = int(self.settings_vars['backup_interval_hours'].get())
+            
+            if 'max_history_days' in self.settings_vars:
+                self.config.database.max_history_days = int(self.settings_vars['max_history_days'].get())
+            
+            # Update backtest settings
+            if 'start_date' in self.settings_vars:
+                self.config.backtest.start_date = self.settings_vars['start_date'].get()
+            
+            if 'end_date' in self.settings_vars:
+                self.config.backtest.end_date = self.settings_vars['end_date'].get()
+            
+            if 'initial_balance' in self.settings_vars:
+                self.config.backtest.initial_balance = float(self.settings_vars['initial_balance'].get())
+            
+            if 'data_source' in self.settings_vars:
+                self.config.backtest.data_source = self.settings_vars['data_source'].get()
+            
+            if 'csv_path' in self.settings_vars:
+                csv_path = self.settings_vars['csv_path'].get()
+                self.config.backtest.csv_path = csv_path if csv_path else None
+            
+            # Update exchange settings
+            for exchange_name, vars_dict in self.exchange_vars.items():
+                if exchange_name in self.config.exchanges:
+                    self.config.exchanges[exchange_name].enabled = vars_dict['enabled'].get()
+                    self.config.exchanges[exchange_name].api_key = vars_dict['api_key'].get()
+                    self.config.exchanges[exchange_name].api_secret = vars_dict['api_secret'].get()
+                    self.config.exchanges[exchange_name].testnet = vars_dict['testnet'].get()
+                    self.config.exchanges[exchange_name].arbitrage_enabled = vars_dict['arbitrage_enabled'].get()
+            
+            # Save to config.local.json
+            config_data = {
+                'trading_mode': self.config.trading_mode.value,
+                'arbitrage': {
+                    'trade_amount_usd': self.config.arbitrage.trade_amount_usd,
+                    'min_profit_threshold': self.config.arbitrage.min_profit_threshold,
+                    'max_position_size': self.config.arbitrage.max_position_size,
+                    'max_symbols': self.config.arbitrage.max_symbols,
+                    'slippage_tolerance': self.config.arbitrage.slippage_tolerance,
+                    'max_spread_age_seconds': self.config.arbitrage.max_spread_age_seconds,
+                    'max_trades_per_hour': self.config.arbitrage.max_trades_per_hour,
+                    'max_spread_threshold': self.config.arbitrage.max_spread_threshold,
+                    'use_dynamic_symbols': self.config.arbitrage.use_dynamic_symbols
+                },
+                'risk_management': {
+                    'max_drawdown_percent': self.config.risk_management.max_drawdown_percent,
+                    'stop_loss_percent': self.config.risk_management.stop_loss_percent,
+                    'position_sizing_method': self.config.risk_management.position_sizing_method,
+                    'max_concurrent_trades': self.config.risk_management.max_concurrent_trades,
+                    'balance_threshold_percent': self.config.risk_management.balance_threshold_percent
+                },
+                'database': {
+                    'db_path': self.config.database.db_path,
+                    'backup_interval_hours': self.config.database.backup_interval_hours,
+                    'max_history_days': self.config.database.max_history_days
+                },
+                'backtest': {
+                    'start_date': self.config.backtest.start_date,
+                    'end_date': self.config.backtest.end_date,
+                    'initial_balance': self.config.backtest.initial_balance,
+                    'data_source': self.config.backtest.data_source,
+                    'csv_path': self.config.backtest.csv_path
+                },
+                'ui': {
+                    'refresh_rate_ms': self.config.ui.refresh_rate_ms,
+                    'log_level': self.config.ui.log_level,
+                    'enable_notifications': self.config.ui.enable_notifications,
+                    'theme': self.config.ui.theme
+                },
+                'exchanges': {
+                    exchange_name: {
+                        'enabled': config.enabled,
+                        'api_key': config.api_key,
+                        'api_secret': config.api_secret,
+                        'testnet': config.testnet,
+                        'arbitrage_enabled': config.arbitrage_enabled
+                    }
+                    for exchange_name, config in self.config.exchanges.items()
+                }
+            }
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname('config.local.json') or '.', exist_ok=True)
+            
+            with open('config.local.json', 'w') as f:
+                json.dump(config_data, f, indent=2)
+            
+            logger.info("Settings saved to config.local.json")
+            
+            # Update GUI variables
+            self.amount_var.set(str(self.config.arbitrage.trade_amount_usd))
+            self.min_profit_var.set(str(self.config.arbitrage.min_profit_threshold * 100))
+            
+            # Update strategy if it exists
+            if self.strategy:
+                self.strategy.config = self.config
+            
+            messagebox.showinfo("Settings", "Settings saved successfully to config.local.json")
+            settings_window.destroy()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {e}")
+            logger.error(f"Error saving settings: {e}")
+    
+    async def _reset_bot_async(self):
+        """Async reset"""
+        try:
+            if self.trading_active:
+                await self._stop_trading()
+            
+            if self.simulator:
+                self.simulator.reset_portfolio()
+            
+            # Clear UI data
+            self.current_opportunities = []
+            self.recent_trades = []
+            self.current_prices = {}
+            self.current_spreads = {}
+            
+            self.root.after(0, self.update_all_displays)
+            logger.info("Bot reset completed")
+            
+        except Exception as e:
+            logger.error(f"Failed to reset bot: {e}")
+    
+    def update_ui(self):
+        """Update UI periodically"""
+        if not self.stop_event.is_set():
+            try:
+                self.run_async(self._update_data())
+            except Exception as e:
+                logger.error(f"Error in UI update: {e}")
+            finally:
+                self.root.after(2000, self.update_ui)  # Update every 2 seconds
+    
+    async def _update_data(self):
+        """Update data from components"""
+        try:
+            current_time = time.time()
+            
+            # Update current prices from exchanges 
+            # Allow data updates even when not actively trading for demo purposes
+            if self.exchanges and self.dynamic_symbols:
+                # Don't clear existing data - preserve it and update incrementally
+                if not hasattr(self, 'current_prices') or not self.current_prices:
+                    self.current_prices = {}
+                
+                for exchange_name, exchange in self.exchanges.items():
+                    # Initialize exchange dict if not exists, but don't clear existing data
+                    if exchange_name not in self.current_prices:
+                        self.current_prices[exchange_name] = {}
+                    
+                    # Use configured max symbols for UI display
+                    max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+                    symbols_to_display = self.dynamic_symbols[:max_symbols]
+                    for symbol in symbols_to_display:
+                        try:
+                            ticker = await exchange.get_ticker(symbol)
+                            if ticker and ticker.bid and ticker.ask:  # Only update if we have valid data
+                                self.current_prices[exchange_name][symbol] = {
+                                    'bid': ticker.bid,
+                                    'ask': ticker.ask,
+                                    'timestamp': ticker.timestamp
+                                }
+                        except Exception as e:
+                            logger.debug(f"Error getting ticker for {exchange_name} {symbol}: {e}")
+                            # Keep existing data if available - don't remove it
+                            continue
+            
+            # Update strategy stats
+            if self.strategy:
+                self.current_opportunities = self.strategy.get_recent_signals(10)
+            
+            # Update trader/simulator stats
+            if self.trader and self.config.trading_mode == TradingMode.LIVE:
+                trader_stats = self.trader.get_stats()
+                self.current_balances = trader_stats.get('balances', {})
+                completed_trades = trader_stats.get('completed_trades', [])
+            elif self.simulator:
+                sim_stats = self.simulator.get_stats()
+                self.current_balances = sim_stats.get('balances', {})
+                completed_trades = sim_stats.get('completed_trades', [])
+                
+                # Update profit display
+                portfolio_value = sim_stats.get('portfolio_value', 0)
+                initial_value = 30000  # Default initial portfolio value
+                profit = portfolio_value - initial_value
+                self.root.after(0, lambda: self.profit_label.config(text=f"Profit: ${profit:.2f}"))
+            else:
+                completed_trades = []
+            
+            # Update recent trades
+            if completed_trades:
+                self.recent_trades = [
+                    {
+                        'time': datetime.fromtimestamp(trade.get('timestamp', current_time)).strftime('%H:%M:%S'),
+                        'symbol': trade.get('symbol', 'N/A'),
+                        'type': 'Arbitrage',
+                        'amount': f"${trade.get('amount', 0):.2f}",
+                        'profit': f"${trade.get('profit', 0):.2f}"
+                    }
+                    for trade in completed_trades[-10:]
+                ]
+            
+            self.last_update = current_time
+            
+            # Update UI
+            self.root.after(0, self.update_all_displays)
+            
+        except Exception as e:
+            logger.error(f"Error updating data: {e}")
+    
+    def update_status_display(self):
+        """Update status display"""
+        if self.trading_active:
+            self.status_label.config(text="● RUNNING", foreground="green")
+            self.start_button.config(text="Stop Trading")
+        else:
+            self.status_label.config(text="● STOPPED", foreground="red")
+            self.start_button.config(text="Start Trading")
+        
+        # Update exchanges and symbols
+        if self.exchanges:
+            exchanges_text = f"Exchanges: {', '.join(self.exchanges.keys()).upper()}"
+            if self.dynamic_symbols:
+                exchanges_text += f" | Symbols: {len(self.dynamic_symbols)}"
+            self.exchanges_label.config(text=exchanges_text)
+        
+        # Update last update time
+        if self.last_update > 0:
+            update_time = datetime.fromtimestamp(self.last_update).strftime('%H:%M:%S')
+            self.last_update_label.config(text=f"Last Update: {update_time}")
+    
+    def update_all_displays(self):
+        """Update all UI displays"""
+        self.update_status_display()
+        self.update_price_display()
+        self.update_opportunities_display()
+        self.update_trades_display()
+    
+    def update_price_display(self):
+        """Update price tree with arbitrage spreads and moving averages"""
+        # Calculate arbitrage spreads between exchanges
+        arbitrage_rows = []
+        
+        # Debug: Log current data status
+        total_symbols = sum(len(symbols) for symbols in self.current_prices.values()) if self.current_prices else 0
+        logger.debug(f"Price display update: {len(self.current_prices)} exchanges, {total_symbols} total symbols")
+        
+        # Only update display if we have sufficient data
+        if len(self.current_prices) >= 2 and total_symbols > 0:
+            # Clear existing items only when we have new data to show
+            for item in self.price_tree.get_children():
+                self.price_tree.delete(item)
+            
+            # Get all exchange pairs
+            exchange_names = list(self.current_prices.keys())
+            for i, exchange1 in enumerate(exchange_names):
+                for j, exchange2 in enumerate(exchange_names):
+                    if i < j:  # Only process each pair once (avoid duplicates)
+                        # Find common symbols
+                        symbols1 = set(self.current_prices[exchange1].keys())
+                        symbols2 = set(self.current_prices[exchange2].keys())
+                        common_symbols = symbols1 & symbols2
+                        
+                        for symbol in common_symbols:
+                            price1_data = self.current_prices[exchange1][symbol]
+                            price2_data = self.current_prices[exchange2][symbol]
+                            
+                            # Check data staleness (skip if data is older than 30 seconds)
+                            current_time = time.time()
+                            if (current_time - price1_data.get('timestamp', 0) > 30 or 
+                                current_time - price2_data.get('timestamp', 0) > 30):
+                                continue
+                            
+                            # Use mid price (average of bid/ask) for arbitrage calculation
+                            price1_bid = price1_data.get('bid', 0)
+                            price1_ask = price1_data.get('ask', 0)
+                            price2_bid = price2_data.get('bid', 0)
+                            price2_ask = price2_data.get('ask', 0)
+                            
+                            if price1_bid > 0 and price1_ask > 0 and price2_bid > 0 and price2_ask > 0:
+                                # Calculate mid prices for comparison
+                                price1_mid = (price1_bid + price1_ask) / 2
+                                price2_mid = (price2_bid + price2_ask) / 2
+                                
+                                # Update moving averages for both exchanges
+                                self.moving_average_manager.update_price(f"{symbol}_{exchange1}", price1_mid)
+                                self.moving_average_manager.update_price(f"{symbol}_{exchange2}", price2_mid)
+                                
+                                # Determine higher and lower price exchanges
+                                if price1_mid > price2_mid:
+                                    higher_exchange = exchange1.upper()
+                                    lower_exchange = exchange2.upper()
+                                    higher_price = price1_mid
+                                    lower_price = price2_mid
+                                    actual_sell_price = price1_bid
+                                    actual_buy_price = price2_ask
+                                else:
+                                    higher_exchange = exchange2.upper()
+                                    lower_exchange = exchange1.upper()
+                                    higher_price = price2_mid
+                                    lower_price = price1_mid
+                                    actual_sell_price = price2_bid
+                                    actual_buy_price = price1_ask
+                                
+                                if lower_price > 0:
+                                    # Calculate spread percentage
+                                    spread_pct = ((higher_price - lower_price) / lower_price) * 100
+                                    
+                                    # Calculate actual arbitrage potential
+                                    if actual_buy_price > 0:
+                                        actual_arbitrage_pct = ((actual_sell_price - actual_buy_price) / actual_buy_price) * 100
+                                    else:
+                                        actual_arbitrage_pct = 0
+                                    
+                                    # Get moving averages and trends
+                                    ma1 = self.moving_average_manager.get_moving_average(f"{symbol}_{exchange1}")
+                                    ma2 = self.moving_average_manager.get_moving_average(f"{symbol}_{exchange2}")
+                                    trend1 = self.moving_average_manager.get_price_trend(f"{symbol}_{exchange1}")
+                                    trend2 = self.moving_average_manager.get_price_trend(f"{symbol}_{exchange2}")
+                                    
+                                    # Calculate price difference
+                                    price_diff = higher_price - lower_price
+                                    
+                                    arbitrage_rows.append({
+                                        'symbol': symbol,
+                                        'higher_exchange': higher_exchange,
+                                        'lower_exchange': lower_exchange,
+                                        'higher_price': higher_price,
+                                        'lower_price': lower_price,
+                                        'price_diff': price_diff,
+                                        'spread_pct': spread_pct,
+                                        'actual_arbitrage_pct': actual_arbitrage_pct,
+                                        'ma1': ma1,
+                                        'ma2': ma2,
+                                        'trend1': trend1,
+                                        'trend2': trend2,
+                                        'exchange1': exchange1,
+                                        'exchange2': exchange2
+                                    })
+        
+            # Store data for sorting and display
+            self.arbitrage_data = arbitrage_rows
+            
+            # Display data with current sort order
+            self.display_arbitrage_data()
+        else:
+            # If we don't have sufficient data, don't clear the existing display
+            # Just log that we're keeping the previous data
+            logger.debug("Insufficient price data - keeping previous display")
+    
+    def update_opportunities_display(self):
+        """Update opportunities tree"""
+        # Clear existing items
+        for item in self.opp_tree.get_children():
+            self.opp_tree.delete(item)
+        
+        # Sort opportunities by profit percentage (highest first)
+        sorted_opportunities = []
+        for opp in self.current_opportunities:
+            if isinstance(opp, ArbitrageSignal):
+                sorted_opportunities.append(opp)
+        
+        # Sort by profit percentage descending
+        sorted_opportunities.sort(key=lambda x: x.profit_percentage, reverse=True)
+        
+        # Add top opportunities (limit to 20 for display)
+        for i, opp in enumerate(sorted_opportunities[:20]):
+            profit_pct = opp.profit_percentage * 100
+            
+            # Color coding based on profit level
+            tag = ""
+            if profit_pct >= 1.0:  # >= 1%
+                tag = "high_profit"
+            elif profit_pct >= 0.5:  # >= 0.5%
+                tag = "medium_profit"
+            else:
+                tag = "low_profit"
+                
+            item = self.opp_tree.insert('', 'end', values=(
+                opp.symbol,
+                opp.buy_exchange.upper(),
+                opp.sell_exchange.upper(),
+                f"{profit_pct:.3f}%",
+                f"${opp.amount:.2f}"
+            ), tags=(tag,))
+        
+        # Configure tags for color coding
+        self.opp_tree.tag_configure("high_profit", background="#2d5a2d", foreground="lightgreen")
+        self.opp_tree.tag_configure("medium_profit", background="#5a4d2d", foreground="yellow")
+        self.opp_tree.tag_configure("low_profit", background="#2d2d2d", foreground="white")
+    
+    def update_trades_display(self):
+        """Update trades tree"""
+        # Clear existing items
+        for item in self.trades_tree.get_children():
+            self.trades_tree.delete(item)
+        
+        # Add recent trades
+        for trade in self.recent_trades:
+            self.trades_tree.insert('', 'end', values=(
+                trade['time'],
+                trade['symbol'],
+                trade['type'],
+                trade['amount'],
+                trade['profit']
+            ))
+    
+    async def _on_arbitrage_signal(self, signal: ArbitrageSignal):
+        """Handle arbitrage signal"""
+        try:
+            logger.info(f"Arbitrage opportunity: {signal.symbol} "
+                       f"{signal.profit_percentage*100:.3f}% profit")
+            
+            # Update opportunities list
+            self.current_opportunities.insert(0, signal)
+            if len(self.current_opportunities) > 10:
+                self.current_opportunities.pop()
+            
+            # Update UI
+            self.root.after(0, self.update_opportunities_display)
+            
+        except Exception as e:
+            logger.error(f"Error processing arbitrage signal: {e}")
+    
+    async def get_common_symbols_with_volume(self) -> List[str]:
+        """Get common symbols across exchanges with sufficient volume"""
+        if len(self.exchanges) < 2:
+            logger.warning("Need at least 2 exchanges for arbitrage")
+            return self.config.arbitrage.symbols
+        
+        arbitrage_exchanges = [name for name, config in self.config.exchanges.items() 
+                              if config.enabled and name in self.exchanges]
+        
+        if len(arbitrage_exchanges) < 2:
+            logger.warning("Need at least 2 enabled exchanges for arbitrage")
+            return self.config.arbitrage.symbols
+        
+        logger.info("Getting common symbols and volume data...")
+        
+        # Get symbols and volumes from each exchange
+        exchange_symbols = {}
+        exchange_volumes = {}
+        
+        for exchange_name in arbitrage_exchanges:
+            exchange = self.exchanges.get(exchange_name)
+            if not exchange:
+                logger.warning(f"Exchange {exchange_name} not found")
+                continue
+                
+            try:
+                # Get all tickers with volume info
+                tickers = await exchange.get_all_tickers()
+                if tickers:
+                    symbols = set()
+                    volumes = {}
+                    
+                    for ticker in tickers:
+                        symbol = ticker.get('symbol')
+                        if not symbol:
+                            continue
+                        
+                        # Extract volume (24h in USDT)
+                        volume_usdt = 0
+                        try:
+                            if exchange_name.lower() == 'bybit':
+                                volume_usdt = float(ticker.get('turnover24h', 0))
+                            elif exchange_name.lower() == 'binance':
+                                volume_usdt = float(ticker.get('quoteVolume', 0))
+                            elif exchange_name.lower() == 'bitget':
+                                volume_usdt = float(ticker.get('quoteVolume', 0))
+                            elif exchange_name.lower() == 'okx':
+                                volume_usdt = float(ticker.get('volCcy24h', 0))
+                            
+                            # Include symbols with valid volume data and enabled quote currency
+                            if volume_usdt > 0 and self._is_symbol_enabled(symbol):
+                                symbols.add(symbol)
+                                volumes[symbol] = volume_usdt
+                                
+                        except (ValueError, TypeError):
+                            continue
+                    
+                    exchange_symbols[exchange_name] = symbols
+                    exchange_volumes[exchange_name] = volumes
+                    logger.info(f"{exchange_name}: {len(symbols)} symbols with sufficient volume")
+                    
+            except Exception as e:
+                logger.error(f"Error getting symbols from {exchange_name}: {e}")
+                exchange_symbols[exchange_name] = set()
+                exchange_volumes[exchange_name] = {}
+        
+        # Find common symbols across all exchanges
+        common_symbols = None
+        for exchange_name, symbols in exchange_symbols.items():
+            if common_symbols is None:
+                common_symbols = symbols.copy()
+            else:
+                common_symbols &= symbols
+        
+        if not common_symbols:
+            logger.warning("No common symbols found, using default symbols")
+            return self.config.arbitrage.symbols
+        
+        # Calculate average volume across exchanges for ranking
+        symbol_avg_volumes = {}
+        for symbol in common_symbols:
+            total_volume = sum(exchange_volumes[ex].get(symbol, 0) for ex in exchange_volumes)
+            avg_volume = total_volume / len(exchange_volumes)
+            symbol_avg_volumes[symbol] = avg_volume
+        
+        # Sort by average volume (descending)
+        sorted_symbols = sorted(symbol_avg_volumes.keys(), 
+                               key=lambda s: symbol_avg_volumes[s], 
+                               reverse=True)
+        
+        # Take top symbols based on configured max_symbols
+        max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+        top_symbols = sorted_symbols[:max_symbols]
+        
+        logger.info(f"Found {len(common_symbols)} common symbols, using top {len(top_symbols)}")
+        logger.info(f"Top 10 symbols by volume: {top_symbols[:10]}")
+        
+        return top_symbols
+    
+    def on_closing(self):
+        """Handle window closing"""
+        if self.trading_active:
+            if messagebox.askokcancel("Quit", "Trading is active. Stop trading and quit?"):
+                self.run_async(self._cleanup_and_quit())
+            else:
+                return
+        else:
+            self.run_async(self._cleanup_and_quit())
+    
+    async def _cleanup_and_quit(self):
+        """Clean up all resources and quit"""
+        try:
+            logger.info("Starting application cleanup")
+            
+            # Stop trading if active
+            if self.trading_active:
+                await self._stop_trading()
+            
+            # Clean up all exchanges
+            for exchange_name, exchange in self.exchanges.items():
+                try:
+                    logger.info(f"Cleaning up exchange: {exchange_name}")
+                    await exchange.disconnect_ws()
+                    if hasattr(exchange, 'session') and exchange.session and not exchange.session.closed:
+                        await exchange.session.close()
+                        logger.info(f"Closed session for {exchange_name}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up exchange {exchange_name}: {e}")
+            
+            logger.info("Cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        finally:
+            # Force quit after cleanup
+            self.root.after(500, self._force_quit)
+    
+    def _force_quit(self):
+        """Force quit application"""
+        self.stop_event.set()
+        if self.event_loop:
+            self.event_loop.call_soon_threadsafe(self.event_loop.stop)
+        self.root.destroy()
+    
+    def run(self):
+        """Run the GUI"""
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.mainloop()
+
+
+class GUILogHandler(logging.Handler):
+    """Custom log handler for GUI"""
+    
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+    
+    def emit(self, record):
+        """Emit log record to text widget"""
+        try:
+            msg = self.format(record)
+            
+            def append_log():
+                self.text_widget.config(state=tk.NORMAL)
+                self.text_widget.insert(tk.END, msg + '\n')
+                self.text_widget.config(state=tk.DISABLED)
+                self.text_widget.see(tk.END)
+            
+            # Schedule GUI update in main thread
+            self.text_widget.after(0, append_log)
+            
+        except Exception:
+            pass
+
+
+async def run_gui(config: Config, database: Database):
+    """Run the GUI application"""
+    gui = None
+    try:
+        logger.info("Starting ArBot GUI application")
+        
+        # Initialize database
+        await database.initialize()
+        
+        # Create and run GUI in main thread
+        def start_gui():
+            nonlocal gui
+            gui = ArBotGUI(config, database)
+            gui.run()
+        
+        # Run GUI in main thread
+        start_gui()
+        
+        logger.info("GUI application finished")
+        
+    except Exception as e:
+        logger.error(f"Error in GUI app: {e}")
+        import traceback
+        logger.error(f"GUI app traceback: {traceback.format_exc()}")
+    finally:
+        # Ensure cleanup happens even if GUI exits unexpectedly
+        if gui and gui.exchanges:
+            logger.info("Final cleanup of exchange sessions")
+            for exchange_name, exchange in gui.exchanges.items():
+                try:
+                    if hasattr(exchange, 'session') and exchange.session and not exchange.session.closed:
+                        await exchange.session.close()
+                        logger.info(f"Final cleanup: closed session for {exchange_name}")
+                except Exception as e:
+                    logger.error(f"Final cleanup error for {exchange_name}: {e}")
+        logger.info("GUI cleanup completed")

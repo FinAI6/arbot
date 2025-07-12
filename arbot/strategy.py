@@ -52,10 +52,18 @@ class ArbitrageStrategy:
         self.signals_generated = 0
         self.signals_executed = 0
         self.total_profit = 0.0
+        
+        # Symbol management
+        self.active_symbols = self.config.arbitrage.symbols  # Default to config symbols
     
     def add_signal_callback(self, callback: callable) -> None:
         """Add callback for arbitrage signals"""
         self.signal_callbacks.append(callback)
+    
+    def set_active_symbols(self, symbols: List[str]) -> None:
+        """Set the list of symbols to monitor for arbitrage opportunities"""
+        self.active_symbols = symbols
+        logger.info(f"Strategy updated to monitor {len(symbols)} symbols")
     
     async def initialize(self, exchanges: Dict[str, BaseExchange]) -> None:
         """Initialize strategy with exchanges"""
@@ -64,7 +72,7 @@ class ArbitrageStrategy:
         # Load trading fees for each exchange
         for exchange_name, exchange in exchanges.items():
             self.exchange_fees[exchange_name] = {}
-            for symbol in self.config.arbitrage.symbols:
+            for symbol in self.active_symbols:
                 try:
                     fees = await exchange.get_trading_fees(symbol)
                     
@@ -103,7 +111,7 @@ class ArbitrageStrategy:
     
     async def _on_ticker_update(self, ticker: Ticker) -> None:
         """Handle ticker updates from exchanges"""
-        if ticker.symbol not in self.config.arbitrage.symbols:
+        if ticker.symbol not in self.active_symbols:
             return
         
         # Find exchange name from the ticker data

@@ -20,7 +20,7 @@ from .strategy import ArbitrageStrategy
 from .trader import LiveTrader
 from .simulator import TradingSimulator
 from .backtester import Backtester
-from .ui import run_ui
+from .gui import run_gui
 from .exchanges import BinanceExchange, BybitExchange, BitgetExchange, OKXExchange
 
 # Configure logging
@@ -71,7 +71,7 @@ class ArBot:
         arbitrage_exchanges = self.config.get_arbitrage_exchanges()
         print(f"⚡ 차익거래 거래소: {', '.join(arbitrage_exchanges)} ({len(arbitrage_exchanges)}개)")
         print(f"🔍 동적 심볼 탐지: {'✅' if self.config.arbitrage.use_dynamic_symbols else '❌'}")
-        print(f"💰 최소 볼륨: ${self.config.arbitrage.min_volume_usdt:,.0f}")
+        print(f"💱 활성화된 단위: {', '.join(self.config.arbitrage.enabled_quote_currencies)}")
         print(f"🚫 최대 스프레드: {self.config.arbitrage.max_spread_threshold:.1f}% (이상치 필터링)")
         print(f"📈 프리미엄 감지: {'✅' if self.config.arbitrage.premium_detection.enabled else '❌'}")
         print()
@@ -84,6 +84,27 @@ class ArBot:
             'backtest': '📊 백테스트'
         }
         return mode_display.get(self.config.trading_mode.value, self.config.trading_mode.value)
+    
+    def _get_quote_currency(self, symbol: str) -> str:
+        """Extract quote currency from symbol (e.g., BTCUSDT -> USDT)"""
+        # Try common quote currencies in order of priority (longest first to avoid conflicts)
+        sorted_quotes = sorted(self.config.arbitrage.available_quote_currencies, key=len, reverse=True)
+        for quote in sorted_quotes:
+            if symbol.endswith(quote):
+                return quote
+        
+        # Additional fallback patterns for edge cases
+        common_patterns = ['USDT', 'BUSD', 'USDC', 'BTC', 'ETH', 'BNB', 'USD', 'EUR']
+        for pattern in common_patterns:
+            if symbol.endswith(pattern):
+                return pattern
+        
+        return "UNKNOWN"
+    
+    def _is_symbol_enabled(self, symbol: str) -> bool:
+        """Check if symbol's quote currency is enabled"""
+        quote_currency = self._get_quote_currency(symbol)
+        return quote_currency in self.config.arbitrage.enabled_quote_currencies
     
     def normalize_ticker(self, ticker_data: Dict, exchange_name: str) -> Dict:
         """Normalize ticker data from different exchanges"""
@@ -524,13 +545,14 @@ class ArBot:
                         except (ValueError, TypeError):
                             volume_usdt = 0
                         
-                        if volume_usdt >= self.config.arbitrage.min_volume_usdt:
+                        # Include symbols with valid volume data and enabled quote currency
+                        if volume_usdt > 0 and self._is_symbol_enabled(symbol):
                             symbols.add(symbol)
                             volumes[symbol] = volume_usdt
                     
                     exchange_symbols[exchange_name] = symbols
                     exchange_volumes[exchange_name] = volumes
-                    print(f"✅ {exchange_name}: {len(symbols)}개 심볼 (볼륨 기준 충족)")
+                    print(f"✅ {exchange_name}: {len(symbols)}개 심볼 발견")
                     
             except Exception as e:
                 print(f"❌ {exchange_name} 심볼 조회 실패: {e}")
@@ -558,19 +580,32 @@ class ArBot:
             volumes = [exchange_volumes[ex].get(symbol, 0) for ex in exchange_volumes]
             symbol_avg_volumes[symbol] = sum(volumes) / len(volumes)
         
-        # Sort by volume descending
+        # Sort by volume descending and take top 200
         sorted_symbols = sorted(symbol_avg_volumes.keys(), 
                               key=lambda s: symbol_avg_volumes[s], reverse=True)
         
-        print(f"🎯 공통 심볼 {len(sorted_symbols)}개 발견 (최소 볼륨: ${self.config.arbitrage.min_volume_usdt:,.0f})")
+        # Limit to configured max symbols for performance and relevance  
+        max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+        final_symbols = sorted_symbols[:max_symbols]
         
-        # Show top 10 symbols by volume
-        top_symbols = sorted_symbols[:10]
+        print(f"🎯 공통 심볼 {len(sorted_symbols)}개 발견, 상위 {len(final_symbols)}개 선택")
+        
+        # Show top 20 symbols by volume
+        top_symbols = final_symbols[:20]
         for i, symbol in enumerate(top_symbols, 1):
             volume = symbol_avg_volumes[symbol]
             print(f"  {i:2}. {symbol}: ${volume:,.0f}")
         
-        return sorted_symbols
+        if len(final_symbols) > 20:
+            print(f"  ... and {len(final_symbols) - 20} more symbols")
+            
+        # Show volume range
+        if final_symbols:
+            highest_volume = symbol_avg_volumes[final_symbols[0]]
+            lowest_volume = symbol_avg_volumes[final_symbols[-1]]
+            print(f"📊 볼륨 범위: ${lowest_volume:,.0f} ~ ${highest_volume:,.0f}")
+        
+        return final_symbols
     
     async def start(self):
         """Start the trading bot"""
@@ -584,6 +619,9 @@ class ArBot:
                 self.dynamic_symbols = self.config.arbitrage.symbols
                 print(f"📋 설정된 심볼 사용: {len(self.dynamic_symbols)}개")
             
+            # Update strategy with dynamic symbols
+            self.strategy.set_active_symbols(self.dynamic_symbols)
+            
             # Start strategy
             await self.strategy.start()
             
@@ -595,7 +633,8 @@ class ArBot:
             
             # Connect to exchange WebSocket feeds
             print("🔗 거래소 WebSocket 연결 중...")
-            symbols_to_monitor = self.dynamic_symbols[:50]  # Limit to top 50 for performance
+            max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+            symbols_to_monitor = self.dynamic_symbols[:max_symbols]  # Limit to configured max for comprehensive monitoring
             print(f"📡 모니터링 심볼: {len(symbols_to_monitor)}개")
             
             for exchange_name, exchange in self.exchanges.items():
@@ -860,10 +899,9 @@ async def main():
         
         # Run based on mode
         if args.mode == 'ui':
-            # Run UI
+            # Run GUI
             database = Database(config.database.db_path)
-            await database.initialize()
-            run_ui(config, database)
+            await run_gui(config, database)
         
         elif args.mode == 'backtest':
             # Run backtest
