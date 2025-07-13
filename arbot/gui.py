@@ -2100,10 +2100,15 @@ class ArBotGUI:
             count = len(self.ticker_buffer)
             await self.database.insert_tickers_batch(self.ticker_buffer)
             
-            # Log without milliseconds
-            now = datetime.now()
-            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-            logger.info(f"{timestamp} - Stored {count} ticker records in batch")
+            # Log less frequently (only every 10th batch)
+            if not hasattr(self, '_batch_flush_count'):
+                self._batch_flush_count = 0
+            self._batch_flush_count += 1
+            
+            if self._batch_flush_count % 10 == 1:
+                now = datetime.now()
+                timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(f"{timestamp} - Stored {count} ticker records in batch (#{self._batch_flush_count})")
             
             # Clear buffer and update timing
             self.ticker_buffer.clear()
@@ -2161,10 +2166,10 @@ class ArBotGUI:
             
             self._ticker_debug_count[exchange_name] += 1
             
-            # Log first 5 ticker updates per exchange to verify WebSocket is working
-            if self._ticker_debug_count[exchange_name] <= 5:
+            # Log first 3 ticker updates per exchange to verify WebSocket is working (reduced for performance)
+            if self._ticker_debug_count[exchange_name] <= 3:
                 print(f"📊 {exchange_name} ticker #{self._ticker_debug_count[exchange_name]}: {ticker.symbol} bid={ticker.bid} ask={ticker.ask}")
-            elif self._ticker_debug_count[exchange_name] == 6:
+            elif self._ticker_debug_count[exchange_name] == 4:
                 print(f"📊 {exchange_name} WebSocket ticker 수신 정상 (계속 수신 중...)")
             
             # Initialize exchange dict if needed
@@ -2179,6 +2184,11 @@ class ArBotGUI:
                 'ask': ticker.ask,
                 'timestamp': ticker.timestamp
             }
+            
+            # Update last received time for this exchange (for UI update optimization)
+            if not hasattr(self, 'last_ticker_received'):
+                self.last_ticker_received = {}
+            self.last_ticker_received[exchange_name] = time.time()
             
             # Track symbol diversity - log for first 20 symbols then periodic summary
             total_symbols = sum(len(symbols) for symbols in self.current_prices.values())
@@ -2237,8 +2247,8 @@ class ArBotGUI:
                     self._ui_update_count = 0
                 self._ui_update_count += 1
                 
-                # Log every 10 updates (every 20 seconds)
-                if self._ui_update_count % 10 == 1:
+                # Log every 100 updates (reduce frequency)  
+                if self._ui_update_count % 100 == 1:
                     logger.info(f"🔄 UI Update #{self._ui_update_count} - Running _update_data()")
                 
                 self.run_async(self._update_data())
@@ -2249,7 +2259,7 @@ class ArBotGUI:
             except Exception as e:
                 logger.error(f"Error in UI update: {e}")
             finally:
-                self.root.after(2000, self.update_ui)  # Update every 2 seconds
+                self.root.after(self.config.ui.refresh_rate_ms, self.update_ui)  # Use configurable refresh rate
     
     async def _update_data(self):
         """Update data from components"""
@@ -2261,8 +2271,8 @@ class ArBotGUI:
                 self._update_data_count = 0
             self._update_data_count += 1
             
-            # Log every 10 calls (every 20 seconds)
-            if self._update_data_count % 10 == 1:
+            # Log every 100 calls (reduce frequency)
+            if self._update_data_count % 100 == 1:
                 logger.info(f"📈 _update_data #{self._update_data_count} - About to call update_all_displays()")
             
             # Initialize current_prices if needed (WebSocket data will populate this)
@@ -2377,24 +2387,41 @@ class ArBotGUI:
             self.last_update_label.config(text=f"Last Update: {update_time}")
     
     def update_all_displays(self):
-        """Update all UI displays"""
+        """Update all UI displays with performance optimization"""
         # Debug: Log UI display updates
         if not hasattr(self, '_display_update_count'):
             self._display_update_count = 0
         self._display_update_count += 1
         
-        # Log every 10 calls (every 20 seconds)
-        if self._display_update_count % 10 == 1:
-            logger.info(f"🖥️ update_all_displays #{self._display_update_count} - Updating all UI components")
+        # Check if we have received new ticker data recently
+        current_time = time.time()
+        should_update_prices = False
         
+        if hasattr(self, 'last_ticker_received'):
+            for exchange_name, last_time in self.last_ticker_received.items():
+                if current_time - last_time < 1.0:  # Data received within last second
+                    should_update_prices = True
+                    break
+        
+        # Log every 100 calls to reduce log spam
+        if self._display_update_count % 100 == 1:  # Further reduce logging frequency
+            logger.info(f"🖥️ update_all_displays #{self._display_update_count} - Updating UI components (price_update={should_update_prices})")
+        
+        # Always update status (lightweight)
         self.update_status_display()
-        self.update_price_display()
-        self.update_opportunities_display()
-        self.update_trades_display()
-        self.update_balance_display()
         
-        if self._display_update_count % 10 == 1:
-            logger.info(f"✅ update_all_displays #{self._display_update_count} - All UI components updated")
+        # Update prices only if we have recent data
+        if should_update_prices:
+            self.update_price_display()
+        
+        # Update other components less frequently
+        if self._display_update_count % 3 == 0:  # Every 3rd update (600ms intervals)
+            self.update_opportunities_display()
+            self.update_trades_display()
+        
+        # Update balance display even less frequently
+        if self._display_update_count % 10 == 0:  # Every 10th update (2 second intervals)
+            self.update_balance_display()
     
     def update_price_display(self):
         """Update price tree with arbitrage spreads and moving averages"""
@@ -2409,15 +2436,9 @@ class ArBotGUI:
             self._price_display_debug_count = 0
         self._price_display_debug_count += 1
         
-        # Log debug info every 10 calls (every 20 seconds)
-        if self._price_display_debug_count % 10 == 1:
+        # Log debug info every 50 calls (reduce logging frequency)
+        if self._price_display_debug_count % 50 == 1:
             logger.info(f"🔍 Price display debug #{self._price_display_debug_count}: {len(self.current_prices) if self.current_prices else 0} exchanges, {total_symbols} total symbols")
-            if self.current_prices:
-                for exchange_name, symbols in self.current_prices.items():
-                    logger.info(f"  {exchange_name}: {len(symbols)} symbols")
-                    if symbols:
-                        sample_symbols = list(symbols.keys())[:3]
-                        logger.info(f"    Sample symbols: {sample_symbols}")
         
         # Only update display if we have sufficient data
         # Allow single exchange mode to show bid-ask spreads
@@ -2477,6 +2498,11 @@ class ArBotGUI:
                                 if lower_price > 0:
                                     # Calculate spread percentage
                                     spread_pct = ((higher_price - lower_price) / lower_price) * 100
+                                    
+                                    # Filter out abnormal spreads
+                                    max_spread_threshold_pct = self.config.arbitrage.max_spread_threshold * 100
+                                    if abs(spread_pct) > max_spread_threshold_pct:
+                                        continue  # Skip abnormal spreads
                                     
                                     # Calculate actual arbitrage potential
                                     if actual_buy_price > 0:
@@ -2577,11 +2603,11 @@ class ArBotGUI:
                 # Display data with current sort order
                 self.display_arbitrage_data()
                 
-                if self._price_display_debug_count % 10 == 1:
+                if self._price_display_debug_count % 50 == 1:
                     logger.info(f"✅ Updated spreads display with {len(arbitrage_rows)} arbitrage opportunities")
             else:
                 # Try single exchange bid-ask spreads as fallback
-                if self._price_display_debug_count % 10 == 1:
+                if self._price_display_debug_count % 50 == 1:
                     logger.info("No multi-exchange arbitrage data, trying single exchange bid-ask spreads...")
                 
                 single_exchange_rows = []
@@ -2597,6 +2623,11 @@ class ArBotGUI:
                             spread_abs = ask - bid
                             spread_pct = (spread_abs / bid) * 100
                             mid_price = (bid + ask) / 2
+                            
+                            # Filter out abnormal spreads for single exchange too
+                            max_spread_threshold_pct = self.config.arbitrage.max_spread_threshold * 100
+                            if abs(spread_pct) > max_spread_threshold_pct:
+                                continue  # Skip abnormal spreads
                             
                             single_exchange_rows.append({
                                 'symbol': symbol,
@@ -2620,14 +2651,14 @@ class ArBotGUI:
                     self.arbitrage_data = single_exchange_rows
                     self.display_arbitrage_data()
                     
-                    if self._price_display_debug_count % 10 == 1:
+                    if self._price_display_debug_count % 50 == 1:
                         logger.info(f"✅ Updated spreads display with {len(single_exchange_rows)} single-exchange spreads")
                 else:
-                    if self._price_display_debug_count % 10 == 1:
+                    if self._price_display_debug_count % 100 == 1:
                         logger.warning("❌ No valid price data found for spreads display")
         else:
             # If we don't have sufficient data, don't clear the existing display
-            if self._price_display_debug_count % 10 == 1:
+            if self._price_display_debug_count % 100 == 1:
                 logger.info("ℹ️ Insufficient price data - keeping previous display")
     
     def update_opportunities_display(self):

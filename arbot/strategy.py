@@ -69,14 +69,10 @@ class ArbitrageStrategy:
         """Initialize strategy with exchanges"""
         logger.info("Initializing arbitrage strategy")
         
-        # Store exchanges reference for fee loading
+        # Store exchanges reference
         self.exchanges = exchanges
         
-        # Initialize exchange fees structure (will be loaded on-demand)
-        for exchange_name in exchanges.keys():
-            self.exchange_fees[exchange_name] = {}
-        
-        logger.info("Trading fees will be loaded on-demand to avoid rate limits")
+        logger.info("Trading fees will be loaded from config")
         
         # Set up ticker callbacks with exchange name closure
         for exchange_name, exchange in exchanges.items():
@@ -91,77 +87,20 @@ class ArbitrageStrategy:
         logger.info("Arbitrage strategy initialized")
     
     async def get_trading_fees(self, exchange_name: str, symbol: str) -> Dict[str, float]:
-        """Get trading fees for exchange and symbol with caching"""
-        # Check if already loaded in memory
-        if exchange_name in self.exchange_fees and symbol in self.exchange_fees[exchange_name]:
-            return self.exchange_fees[exchange_name][symbol]
-        
-        # Check database cache first
-        try:
-            cached_fee = await self.database.get_trading_fee(exchange_name, symbol)
-            if cached_fee:
-                # Check if cache is fresh (within 24 hours)
-                if time.time() - cached_fee.timestamp < 24 * 3600:
-                    fees = {'maker': cached_fee.maker_fee, 'taker': cached_fee.taker_fee}
-                    self.exchange_fees[exchange_name][symbol] = fees
-                    logger.debug(f"Using cached fees for {exchange_name} {symbol}: {fees}")
-                    return fees
-        except Exception as e:
-            logger.warning(f"Error checking cached fees for {exchange_name} {symbol}: {e}")
-        
-        # Load from exchange API and cache it
-        try:
-            exchange = self.exchanges.get(exchange_name)
-            if not exchange:
-                logger.warning(f"Exchange {exchange_name} not found, using default fees")
-                fees = {'maker': 0.001, 'taker': 0.001}
-            else:
-                fees = await exchange.get_trading_fees(symbol)
-                
-                # Validate fee structure
-                if not fees or not isinstance(fees, dict):
-                    logger.warning(f"Invalid fee structure for {exchange_name} {symbol}, using defaults")
-                    fees = {'maker': 0.001, 'taker': 0.001}
-                else:
-                    # Validate fee values
-                    try:
-                        maker_fee = float(fees.get('maker', 0.001))
-                        taker_fee = float(fees.get('taker', 0.001))
-                        
-                        # Sanity check: fees should be between 0 and 10%
-                        if not (0 <= maker_fee <= 0.1) or not (0 <= taker_fee <= 0.1):
-                            logger.warning(f"Invalid fee range for {exchange_name} {symbol}, using defaults")
-                            fees = {'maker': 0.001, 'taker': 0.001}
-                        else:
-                            fees = {'maker': maker_fee, 'taker': taker_fee}
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid fee values for {exchange_name} {symbol}, using defaults")
-                        fees = {'maker': 0.001, 'taker': 0.001}
-                
-                # Cache in database
-                try:
-                    from .database import TradingFeeRecord
-                    fee_record = TradingFeeRecord(
-                        exchange=exchange_name,
-                        symbol=symbol,
-                        maker_fee=fees['maker'],
-                        taker_fee=fees['taker'],
-                        timestamp=time.time()
-                    )
-                    await self.database.insert_or_update_trading_fee(fee_record)
-                    logger.info(f"Cached trading fees for {exchange_name} {symbol}: {fees}")
-                except Exception as e:
-                    logger.warning(f"Error caching fees for {exchange_name} {symbol}: {e}")
-            
-            # Store in memory cache
-            self.exchange_fees[exchange_name][symbol] = fees
+        """Get trading fees from config for exchange and symbol"""
+        # Get fees from exchange config
+        exchange_config = self.config.exchanges.get(exchange_name)
+        if exchange_config:
+            fees = {
+                'maker': exchange_config.maker_fee,
+                'taker': exchange_config.taker_fee
+            }
+            logger.debug(f"Using config fees for {exchange_name}: {fees}")
             return fees
-            
-        except Exception as e:
-            logger.error(f"Error loading fees for {exchange_name} {symbol}: {e}")
-            # Return default fees
+        else:
+            # Fallback to default fees
+            logger.warning(f"Exchange {exchange_name} not found in config, using default fees")
             fees = {'maker': 0.001, 'taker': 0.001}
-            self.exchange_fees[exchange_name][symbol] = fees
             return fees
     
     async def _on_ticker_update(self, ticker: Ticker, exchange_name: str) -> None:
@@ -169,12 +108,19 @@ class ArbitrageStrategy:
         if ticker.symbol not in self.active_symbols:
             return
         
+        # Get fees from config
+        exchange_config = self.config.exchanges.get(exchange_name)
+        fees = {
+            'maker': exchange_config.maker_fee if exchange_config else 0.001,
+            'taker': exchange_config.taker_fee if exchange_config else 0.001
+        }
+        
         # Update exchange data
         self.exchange_data[exchange_name][ticker.symbol] = ExchangeData(
             exchange_name=exchange_name,
             ticker=ticker,
             last_updated=ticker.timestamp,
-            fees=self.exchange_fees.get(exchange_name, {}).get(ticker.symbol, {'maker': 0.001, 'taker': 0.001})
+            fees=fees
         )
         
         # Store ticker in database

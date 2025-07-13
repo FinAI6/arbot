@@ -129,9 +129,9 @@ class BinanceExchange(BaseExchange):
         try:
             self.ws_connection = await websockets.connect(
                 stream_url,
-                ping_interval=20,  # 20초마다 ping
-                ping_timeout=10,   # ping 응답 대기 시간
-                close_timeout=10   # 연결 종료 대기 시간
+                ping_interval=10,  # 10초마다 ping (더 빠른 응답)
+                ping_timeout=5,    # ping 응답 대기 시간 단축
+                close_timeout=5    # 연결 종료 대기 시간 단축
             )
             self.connected = True
             

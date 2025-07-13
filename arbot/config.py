@@ -27,6 +27,8 @@ class ExchangeConfig:
     arbitrage_enabled: bool = True
     region: str = "global"
     premium_baseline: float = 0.0
+    maker_fee: float = 0.001
+    taker_fee: float = 0.001
 
 
 @dataclass
@@ -58,8 +60,8 @@ class ArbitrageConfig:
     moving_average_periods: int = 30  # Moving average period in seconds
     
     # Trend-based arbitrage filtering
-    use_trend_filter: bool = True  # Enable trend-based arbitrage filtering
-    trend_filter_mode: str = "uptrend_buy_low"  # Modes: "uptrend_buy_low", "downtrend_sell_high", "both", "disabled"
+    use_trend_filter: bool = False  # Enable trend-based arbitrage filtering
+    trend_filter_mode: str = "disabled"  # Modes: "uptrend_buy_low", "downtrend_sell_high", "both", "disabled"
     trend_confirmation_threshold: float = 0.001  # 0.1% price movement to confirm trend
     
     premium_detection: PremiumDetectionConfig = field(default_factory=PremiumDetectionConfig)
@@ -79,7 +81,7 @@ class DatabaseConfig:
     db_path: str = "data/arbot.db"
     backup_interval_hours: int = 24
     max_history_days: int = 30
-    store_ticker_data: bool = True
+    store_ticker_data: bool = False
     ticker_storage_mode: str = "batch"  # "individual" or "batch"
     ticker_storage_interval_seconds: int = 60
     ticker_batch_size: int = 100
@@ -175,7 +177,9 @@ class Config:
                         enabled=exchange_data.get('enabled', existing.enabled),
                         arbitrage_enabled=exchange_data.get('arbitrage_enabled', existing.arbitrage_enabled),
                         region=exchange_data.get('region', existing.region),
-                        premium_baseline=exchange_data.get('premium_baseline', existing.premium_baseline)
+                        premium_baseline=exchange_data.get('premium_baseline', existing.premium_baseline),
+                        maker_fee=exchange_data.get('maker_fee', existing.maker_fee),
+                        taker_fee=exchange_data.get('taker_fee', existing.taker_fee)
                     )
                 else:
                     # Create new config with values from config file (no defaults from ExchangeConfig)
@@ -187,7 +191,9 @@ class Config:
                         enabled=exchange_data.get('enabled', True),  # Only use True as fallback for new configs
                         arbitrage_enabled=exchange_data.get('arbitrage_enabled', True),
                         region=exchange_data.get('region', 'global'),
-                        premium_baseline=exchange_data.get('premium_baseline', 0.0)
+                        premium_baseline=exchange_data.get('premium_baseline', 0.0),
+                        maker_fee=exchange_data.get('maker_fee', 0.001),
+                        taker_fee=exchange_data.get('taker_fee', 0.001)
                     )
         
         if 'arbitrage' in config_data:
@@ -218,8 +224,8 @@ class Config:
                 enabled_quote_currencies=arb_data.get('enabled_quote_currencies', ["USDT"]),
                 available_quote_currencies=arb_data.get('available_quote_currencies', ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"]),
                 moving_average_periods=arb_data.get('moving_average_periods', 30),
-                use_trend_filter=arb_data.get('use_trend_filter', True),
-                trend_filter_mode=arb_data.get('trend_filter_mode', "uptrend_buy_low"),
+                use_trend_filter=arb_data.get('use_trend_filter', False),
+                trend_filter_mode=arb_data.get('trend_filter_mode', "disabled"),
                 trend_confirmation_threshold=arb_data.get('trend_confirmation_threshold', 0.001),
                 premium_detection=premium_config
             )
@@ -288,7 +294,9 @@ class Config:
                         enabled=existing.enabled,  # Preserve existing enabled setting
                         arbitrage_enabled=existing.arbitrage_enabled,  # Preserve existing arbitrage_enabled setting
                         region=existing.region,
-                        premium_baseline=existing.premium_baseline
+                        premium_baseline=existing.premium_baseline,
+                        maker_fee=existing.maker_fee,
+                        taker_fee=existing.taker_fee
                     )
                 else:
                     # Create new config only if no existing config found
@@ -297,7 +305,9 @@ class Config:
                         api_key=api_key,
                         api_secret=api_secret,
                         testnet=testnet,
-                        enabled=True  # Default to enabled for new exchanges
+                        enabled=True,  # Default to enabled for new exchanges
+                        maker_fee=0.001,
+                        taker_fee=0.001
                     )
         
         # Trading mode

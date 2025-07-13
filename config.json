@@ -1,37 +1,7 @@
 {
   "trading_mode": "simulation",
-  "exchanges": {
-    "binance": {
-      "enabled": true,
-      "arbitrage_enabled": true,
-      "testnet": false,
-      "region": "global",
-      "premium_baseline": 0.0
-    },
-    "bybit": {
-      "enabled": true,
-      "arbitrage_enabled": true,
-      "testnet": false,
-      "region": "global",
-      "premium_baseline": 0.0
-    },
-    "bitget": {
-      "enabled": false,
-      "arbitrage_enabled": false,
-      "testnet": false,
-      "region": "global",
-      "premium_baseline": 0.0
-    },
-    "okx": {
-      "enabled": false,
-      "arbitrage_enabled": false,
-      "testnet": false,
-      "region": "global",
-      "premium_baseline": 0.0
-    }
-  },
   "arbitrage": {
-    "min_profit_threshold": 0.005,
+    "min_profit_threshold": 0.01,
     "max_position_size": 1000.0,
     "trade_amount_usd": 100.0,
     "max_symbols": 200,
@@ -61,14 +31,62 @@
     "enabled_quote_currencies": ["USDT"],
     "available_quote_currencies": ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"],
     "moving_average_periods": 30,
-    "use_trend_filter": true,
-    "trend_filter_mode": "uptrend_buy_low",
+    "use_trend_filter": false,
+    "trend_filter_mode": "disabled",
     "trend_confirmation_threshold": 0.001,
     "premium_detection": {
       "enabled": true,
       "lookback_periods": 100,
       "min_samples": 70,
       "outlier_threshold": 2.0
+    }
+  },
+  "database": {
+    "db_path": "arbot.db",
+    "backup_interval_hours": 24,
+    "max_history_days": 30,
+    "store_ticker_data": false,
+    "ticker_storage_mode": "batch",
+    "ticker_storage_interval_seconds": 5,
+    "ticker_batch_size": 50,
+    "ticker_batch_interval_seconds": 10
+  },
+  "exchanges": {
+    "binance": {
+      "enabled": true,
+      "arbitrage_enabled": true,
+      "testnet": false,
+      "region": "global",
+      "premium_baseline": 0.0,
+      "maker_fee": 0.001,
+      "taker_fee": 0.001
+    },
+    "bybit": {
+      "enabled": true,
+      "arbitrage_enabled": true,
+      "testnet": false,
+      "region": "global",
+      "premium_baseline": 0.0,
+      "maker_fee": 0.001,
+      "taker_fee": 0.001
+    },
+    "bitget": {
+      "enabled": false,
+      "arbitrage_enabled": false,
+      "testnet": false,
+      "region": "global",
+      "premium_baseline": 0.0,
+      "maker_fee": 0.001,
+      "taker_fee": 0.001
+    },
+    "okx": {
+      "enabled": false,
+      "arbitrage_enabled": false,
+      "testnet": false,
+      "region": "global",
+      "premium_baseline": 0.0,
+      "maker_fee": 0.0008,
+      "taker_fee": 0.001
     }
   },
   "risk_management": {
@@ -78,18 +96,8 @@
     "max_concurrent_trades": 3,
     "balance_threshold_percent": 10.0
   },
-  "database": {
-    "db_path": "arbot.db",
-    "backup_interval_hours": 24,
-    "max_history_days": 30,
-    "store_ticker_data": true,
-    "ticker_storage_mode": "batch",
-    "ticker_storage_interval_seconds": 60,
-    "ticker_batch_size": 100,
-    "ticker_batch_interval_seconds": 30
-  },
   "ui": {
-    "refresh_rate_ms": 500,
+    "refresh_rate_ms": 200,
     "enable_notifications": true,
     "log_level": "INFO",
     "theme": "dark"
