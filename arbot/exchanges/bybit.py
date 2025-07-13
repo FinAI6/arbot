@@ -139,7 +139,7 @@ class BybitExchange(BaseExchange):
         
         # Bybit has stricter limits on WebSocket subscriptions
         # Reduce to ticker only to avoid rate limits and improve stability
-        max_symbols_per_connection = 100   # Maximum for single batch subscription
+        max_symbols_per_connection = 150   # Maximum for single batch subscription
         
         if len(symbols) > max_symbols_per_connection:
             print(f"⚠️ Bybit 심볼 수 제한: {len(symbols)} → {max_symbols_per_connection}")
