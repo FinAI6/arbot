@@ -97,7 +97,7 @@
     "balance_threshold_percent": 10.0
   },
   "ui": {
-    "refresh_rate_ms": 200,
+    "refresh_rate_ms": 1000,
     "enable_notifications": true,
     "log_level": "INFO",
     "theme": "dark"

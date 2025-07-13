@@ -99,7 +99,7 @@ class BinanceExchange(BaseExchange):
         
         # Binance has a limit on streams per connection (200 streams max)
         # Now that message format is fixed, restore to full capacity
-        max_symbols_per_connection = 200  # Full test with all 200 symbols as requested
+        max_symbols_per_connection = 80   # Reduce dramatically to avoid system overload
         
         if len(symbols) > max_symbols_per_connection:
             logger.warning(f"Binance WebSocket: Too many symbols ({len(symbols)}), limiting to {max_symbols_per_connection}")
@@ -129,9 +129,9 @@ class BinanceExchange(BaseExchange):
         try:
             self.ws_connection = await websockets.connect(
                 stream_url,
-                ping_interval=10,  # 10초마다 ping (더 빠른 응답)
-                ping_timeout=5,    # ping 응답 대기 시간 단축
-                close_timeout=5    # 연결 종료 대기 시간 단축
+                ping_interval=20,  # 표준화된 ping 간격
+                ping_timeout=10,   # 표준화된 ping 타임아웃
+                close_timeout=10   # 표준화된 종료 타임아웃
             )
             self.connected = True
             

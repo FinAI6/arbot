@@ -136,17 +136,33 @@ class BybitExchange(BaseExchange):
     
     async def connect_ws(self, symbols: List[str]) -> None:
         self.symbols = symbols
-        self._expected_subscriptions = len(symbols) * 2  # ticker + orderbook for each symbol
+        
+        # Bybit has stricter limits on WebSocket subscriptions
+        # Reduce to ticker only to avoid rate limits and improve stability
+        max_symbols_per_connection = 50   # Reduce dramatically to avoid system overload
+        
+        if len(symbols) > max_symbols_per_connection:
+            print(f"⚠️ Bybit 심볼 수 제한: {len(symbols)} → {max_symbols_per_connection}")
+            symbols = symbols[:max_symbols_per_connection]
+            self.symbols = symbols
+        
+        self._expected_subscriptions = len(symbols)  # Only ticker subscriptions
         self._subscription_count = 0
         
         try:
-            self.ws_connection = await websockets.connect(self.ws_url)
+            self.ws_connection = await websockets.connect(
+                self.ws_url,
+                ping_interval=20,  # 표준화된 ping 간격
+                ping_timeout=10,   # 표준화된 ping 타임아웃
+                close_timeout=10   # 표준화된 종료 타임아웃
+            )
             self.connected = True
             
-            # Subscribe to tickers and orderbooks
+            # Subscribe to tickers only (remove orderbook to reduce load)
             for symbol in symbols:
                 await self._subscribe_ticker(symbol)
-                await self._subscribe_orderbook(symbol)
+                # Skip orderbook subscription to reduce connection load
+                # await self._subscribe_orderbook(symbol)
             
             self._ws_task = asyncio.create_task(self._handle_ws_messages())
         except Exception as e:
@@ -182,65 +198,136 @@ class BybitExchange(BaseExchange):
         self.connected = False
     
     async def _handle_ws_messages(self) -> None:
-        try:
-            async for message in self.ws_connection:
-                try:
-                    data = json.loads(message)
+        """Handle WebSocket messages with automatic reconnection"""
+        max_retries = 5  # Reduce retry attempts to avoid rate limits
+        retry_count = 0
+        base_delay = 5   # Start with longer delay for rate limit recovery
+        max_delay = 120  # Longer max delay
+        
+        while self.connected or retry_count == 0:
+            try:
+                # If this is a reconnection attempt, recreate the WebSocket connection
+                if retry_count > 0:
+                    print(f"🔄 Bybit WebSocket 재연결 시도 {retry_count}/{max_retries}...")
+                    self.ws_connection = await websockets.connect(
+                        self.ws_url,
+                        ping_interval=20,  # 표준화된 ping 간격
+                        ping_timeout=10,   # 표준화된 ping 타임아웃
+                        close_timeout=10   # 표준화된 종료 타임아웃
+                    )
                     
-                    # Handle different message types
-                    if 'topic' in data and 'data' in data:
-                        topic = data['topic']
+                    # Re-subscribe to all symbols (ticker only)
+                    self._subscription_count = 0
+                    for symbol in self.symbols:
+                        await self._subscribe_ticker(symbol)
+                        # Skip orderbook subscription to reduce connection load
+                    
+                    print(f"✅ Bybit WebSocket 재연결 성공 (시도 {retry_count})")
+                
+                # Reset retry count on successful connection
+                retry_count = 0
+                self.connected = True
+                
+                # Process messages
+                async for message in self.ws_connection:
+                    if not self.connected:
+                        break
                         
-                        if topic.startswith('tickers.'):
-                            await self._handle_ticker_data(data['data'])
-                        elif topic.startswith('orderbook.'):
-                            await self._handle_orderbook_data(data['data'])
-                    elif 'success' in data:
-                        # Subscription success message - count and show summary
-                        if data.get('success') and data.get('ret_msg') == 'subscribe':
-                            self._subscription_count += 1
-                            if self._subscription_count == 1:
-                                # Show connection info on first success
-                                conn_id = data.get('conn_id', 'unknown')
-                                print(f"✅ Bybit WebSocket 연결 완료 (ID: {conn_id[:8]}...)")
-                            elif self._subscription_count == self._expected_subscriptions:
-                                # Show final summary when all subscriptions are complete
-                                symbol_count = len(self.symbols) if hasattr(self, 'symbols') else 0
-                                print(f"✅ Bybit 구독 완료: {symbol_count}개 심볼 (총 {self._subscription_count}개 채널)")
-                        else:
-                            # Parse subscription error details
-                            ret_msg = data.get('ret_msg', 'unknown')
-                            if 'Invalid symbol' in ret_msg:
-                                # Extract symbol name from error message
-                                import re
-                                symbol_match = re.search(r'\[(.*?)\]', ret_msg)
-                                if symbol_match:
-                                    failed_channel = symbol_match.group(1)
-                                    # Extract symbol from channel (e.g., tickers.IOTAUSDT -> IOTAUSDT)
-                                    if '.' in failed_channel:
-                                        symbol = failed_channel.split('.')[-1]
-                                        print(f"⚠️ Bybit 구독 실패: Invalid symbol [{symbol}]")
+                    try:
+                        data = json.loads(message)
+                        
+                        # Handle different message types
+                        if 'topic' in data and 'data' in data:
+                            topic = data['topic']
+                            
+                            if topic.startswith('tickers.'):
+                                await self._handle_ticker_data(data['data'])
+                            elif topic.startswith('orderbook.'):
+                                await self._handle_orderbook_data(data['data'])
+                        elif 'success' in data:
+                            # Subscription success message - count and show summary
+                            if data.get('success') and data.get('ret_msg') == 'subscribe':
+                                self._subscription_count += 1
+                                if self._subscription_count == 1:
+                                    # Show connection info on first success
+                                    conn_id = data.get('conn_id', 'unknown')
+                                    print(f"✅ Bybit WebSocket 연결 완료 (ID: {conn_id[:8]}...)")
+                                elif self._subscription_count == self._expected_subscriptions:
+                                    # Show final summary when all subscriptions are complete
+                                    symbol_count = len(self.symbols) if hasattr(self, 'symbols') else 0
+                                    print(f"✅ Bybit 구독 완료: {symbol_count}개 심볼 (총 {self._subscription_count}개 채널)")
+                            else:
+                                # Parse subscription error details
+                                ret_msg = data.get('ret_msg', 'unknown')
+                                if 'Invalid symbol' in ret_msg:
+                                    # Extract symbol name from error message
+                                    import re
+                                    symbol_match = re.search(r'\[(.*?)\]', ret_msg)
+                                    if symbol_match:
+                                        failed_channel = symbol_match.group(1)
+                                        # Extract symbol from channel (e.g., tickers.IOTAUSDT -> IOTAUSDT)
+                                        if '.' in failed_channel:
+                                            symbol = failed_channel.split('.')[-1]
+                                            print(f"⚠️ Bybit 구독 실패: Invalid symbol [{symbol}]")
+                                        else:
+                                            print(f"⚠️ Bybit 구독 실패: {ret_msg}")
                                     else:
                                         print(f"⚠️ Bybit 구독 실패: {ret_msg}")
                                 else:
-                                    print(f"⚠️ Bybit 구독 실패: {ret_msg}")
-                            else:
-                                print(f"⚠️ Bybit 구독: {ret_msg}")
-                    elif 'ret_msg' in data:
-                        # Error message
-                        print(f"❌ Bybit 오류: {data.get('ret_msg', 'unknown error')}")
-                    else:
-                        # Silently ignore other messages
-                        pass
+                                    print(f"⚠️ Bybit 구독: {ret_msg}")
+                        elif 'ret_msg' in data:
+                            # Error message
+                            print(f"❌ Bybit 오류: {data.get('ret_msg', 'unknown error')}")
+                        else:
+                            # Silently ignore other messages
+                            pass
+                            
+                    except json.JSONDecodeError as e:
+                        print(f"Failed to parse Bybit WebSocket message: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"Error handling Bybit WebSocket message: {e}")
+                        continue
                         
-                except json.JSONDecodeError as e:
-                    print(f"Failed to parse WebSocket message: {e}, message: {message}")
-                except Exception as e:
-                    print(f"Error handling WebSocket message: {e}, data: {message}")
-                        
-        except Exception as e:
-            print(f"WebSocket connection error: {e}")
-            self.connected = False
+            except websockets.exceptions.ConnectionClosed as e:
+                if not self.connected:
+                    print("Bybit WebSocket connection closed by user")
+                    break
+                
+                # Check for rate limit related closures
+                if "1011" in str(e) or "keepalive ping timeout" in str(e):
+                    print(f"⚠️ Bybit WebSocket rate limit detected: {e}")
+                    # Add extra delay for rate limit recovery
+                    await asyncio.sleep(30)
+                else:
+                    print(f"⚠️ Bybit WebSocket connection closed: {e}")
+                
+            except websockets.exceptions.WebSocketException as e:
+                print(f"⚠️ Bybit WebSocket exception: {e}")
+                
+            except (OSError, ConnectionError, asyncio.TimeoutError) as e:
+                print(f"⚠️ Bybit WebSocket network error: {e}")
+                
+            except Exception as e:
+                print(f"❌ Bybit WebSocket unexpected error: {e}")
+            
+            # Reconnection logic
+            if not self.connected:
+                break
+                
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"❌ Bybit WebSocket failed to reconnect after {max_retries} attempts")
+                self.connected = False
+                break
+            
+            # Exponential backoff with rate limit consideration
+            delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
+            print(f"⏳ Bybit WebSocket reconnecting in {delay:.2f} seconds (avoiding rate limits)...")
+            await asyncio.sleep(delay)
+        
+        print("Bybit WebSocket connection permanently closed")
+        self.connected = False
     
     async def _handle_ticker_data(self, data: Dict) -> None:
         try:
