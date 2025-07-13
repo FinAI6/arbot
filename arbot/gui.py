@@ -1742,9 +1742,6 @@ class ArBotGUI:
         
         # Only update display if we have sufficient data
         if len(self.current_prices) >= 2 and total_symbols > 0:
-            # Clear existing items only when we have new data to show
-            for item in self.price_tree.get_children():
-                self.price_tree.delete(item)
             
             # Get all exchange pairs
             exchange_names = list(self.current_prices.keys())
@@ -1760,10 +1757,10 @@ class ArBotGUI:
                             price1_data = self.current_prices[exchange1][symbol]
                             price2_data = self.current_prices[exchange2][symbol]
                             
-                            # Check data staleness (skip if data is older than 30 seconds)
+                            # Check data staleness (use more lenient threshold to keep display populated)
                             current_time = time.time()
-                            if (current_time - price1_data.get('timestamp', 0) > 30 or 
-                                current_time - price2_data.get('timestamp', 0) > 30):
+                            if (current_time - price1_data.get('timestamp', 0) > 60 or 
+                                current_time - price2_data.get('timestamp', 0) > 60):
                                 continue
                             
                             # Use mid price (average of bid/ask) for arbitrage calculation
@@ -1833,11 +1830,19 @@ class ArBotGUI:
                                         'exchange2': exchange2
                                     })
         
-            # Store data for sorting and display
-            self.arbitrage_data = arbitrage_rows
-            
-            # Display data with current sort order
-            self.display_arbitrage_data()
+            # Only clear and update display if we have valid arbitrage data
+            if arbitrage_rows:
+                # Clear existing items only when we have new data to show
+                for item in self.price_tree.get_children():
+                    self.price_tree.delete(item)
+                
+                # Store data for sorting and display
+                self.arbitrage_data = arbitrage_rows
+                
+                # Display data with current sort order
+                self.display_arbitrage_data()
+            else:
+                logger.debug("No valid arbitrage data found - keeping previous display")
         else:
             # If we don't have sufficient data, don't clear the existing display
             # Just log that we're keeping the previous data
