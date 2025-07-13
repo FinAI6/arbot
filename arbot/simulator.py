@@ -592,3 +592,31 @@ class TradingSimulator:
     def get_completed_trades(self) -> List[SimulatedTrade]:
         """Get completed trades"""
         return self.completed_trades
+    
+    def reset_portfolio(self) -> None:
+        """Reset the simulator portfolio to initial state"""
+        try:
+            # Clear all active and completed trades
+            self.active_trades.clear()
+            self.completed_trades.clear()
+            self.orders.clear()
+            
+            # Reset counters and statistics
+            self.trade_counter = 0
+            self.total_trades = 0
+            self.successful_trades = 0
+            self.failed_trades = 0
+            self.total_profit = 0.0
+            self.total_fees = 0.0
+            self.total_volume = 0.0
+            self.max_drawdown = 0.0
+            self.current_drawdown = 0.0
+            
+            # Reinitialize balances to starting values
+            self._initialize_balances()
+            
+            logger.info("Portfolio reset to initial state")
+            
+        except Exception as e:
+            logger.error(f"Error resetting portfolio: {e}")
+            raise

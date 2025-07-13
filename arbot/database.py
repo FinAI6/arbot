@@ -1,6 +1,7 @@
 import sqlite3
 import asyncio
 import aiosqlite
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, asdict
@@ -87,9 +88,23 @@ class BalanceRecord:
     created_at: Optional[datetime] = None
 
 
+@dataclass
+class TradingFeeRecord:
+    id: Optional[int] = None
+    exchange: str = ""
+    symbol: str = ""
+    maker_fee: float = 0.001
+    taker_fee: float = 0.001
+    timestamp: float = 0.0
+    created_at: Optional[datetime] = None
+
+
 class Database:
-    def __init__(self, db_path: str = "arbot.db"):
-        self.db_path = db_path
+    def __init__(self, config = None):
+        if config and hasattr(config, 'database'):
+            self.db_path = config.database.db_path
+        else:
+            self.db_path = "arbot.db"
         self._initialized = False
     
     async def initialize(self) -> None:
@@ -193,6 +208,20 @@ class Database:
             )
         ''')
         
+        # Trading fees table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS trading_fees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                maker_fee REAL NOT NULL,
+                taker_fee REAL NOT NULL,
+                timestamp REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(exchange, symbol)
+            )
+        ''')
+        
         # Create indexes for better performance
         await db.execute('CREATE INDEX IF NOT EXISTS idx_tickers_exchange_symbol ON tickers(exchange, symbol)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_tickers_timestamp ON tickers(timestamp)')
@@ -201,6 +230,7 @@ class Database:
         await db.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_arbitrage_symbol ON arbitrage_opportunities(symbol)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_balances_exchange_asset ON balances(exchange, asset)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_trading_fees_exchange_symbol ON trading_fees(exchange, symbol)')
     
     async def insert_ticker(self, ticker: TickerRecord) -> int:
         """Insert ticker data"""
@@ -212,6 +242,22 @@ class Database:
                   ticker.bid_size, ticker.ask_size, ticker.timestamp))
             await db.commit()
             return cursor.lastrowid
+    
+    async def insert_tickers_batch(self, tickers: List[TickerRecord]) -> int:
+        """Insert multiple ticker records in a single transaction"""
+        if not tickers:
+            return 0
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            data = [(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, 
+                    ticker.bid_size, ticker.ask_size, ticker.timestamp) for ticker in tickers]
+            
+            await db.executemany('''
+                INSERT INTO tickers (exchange, symbol, bid, ask, bid_size, ask_size, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', data)
+            await db.commit()
+            return len(tickers)
     
     async def insert_order(self, order: OrderRecord) -> int:
         """Insert order data"""
@@ -368,6 +414,51 @@ class Database:
                 WHERE order_id = ? AND exchange = ?
             ''', (status, filled_quantity, average_price, order_id, exchange))
             await db.commit()
+    
+    async def insert_or_update_trading_fee(self, fee: TradingFeeRecord) -> None:
+        """Insert or update trading fee data"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO trading_fees (exchange, symbol, maker_fee, taker_fee, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (fee.exchange, fee.symbol, fee.maker_fee, fee.taker_fee, fee.timestamp))
+            await db.commit()
+    
+    async def get_trading_fee(self, exchange: str, symbol: str) -> Optional[TradingFeeRecord]:
+        """Get trading fee for exchange and symbol"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute('''
+                SELECT * FROM trading_fees 
+                WHERE exchange = ? AND symbol = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ''', (exchange, symbol))
+            row = await cursor.fetchone()
+            
+            if row:
+                return TradingFeeRecord(**dict(row))
+            return None
+    
+    async def get_cached_trading_fees(self, exchange: str, max_age_hours: int = 24) -> Dict[str, Dict[str, float]]:
+        """Get all cached trading fees for an exchange within max age"""
+        cutoff_time = time.time() - (max_age_hours * 3600)
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute('''
+                SELECT symbol, maker_fee, taker_fee FROM trading_fees 
+                WHERE exchange = ? AND timestamp > ?
+            ''', (exchange, cutoff_time))
+            rows = await cursor.fetchall()
+            
+            fees = {}
+            for row in rows:
+                fees[row['symbol']] = {
+                    'maker': row['maker_fee'],
+                    'taker': row['taker_fee']
+                }
+            return fees
     
     async def cleanup_old_data(self, days: int = 30) -> None:
         """Remove old data beyond specified days"""

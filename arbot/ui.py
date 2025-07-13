@@ -372,7 +372,7 @@ class ArbitrageBotApp(App):
                     pass
         
         ui_handler = UILogHandler(log_widget)
-        ui_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        ui_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
         
         # Add handler to root logger
         logging.getLogger().addHandler(ui_handler)

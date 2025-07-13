@@ -72,7 +72,7 @@ class ArBot:
         print(f"⚡ 차익거래 거래소: {', '.join(arbitrage_exchanges)} ({len(arbitrage_exchanges)}개)")
         print(f"🔍 동적 심볼 탐지: {'✅' if self.config.arbitrage.use_dynamic_symbols else '❌'}")
         print(f"💱 활성화된 단위: {', '.join(self.config.arbitrage.enabled_quote_currencies)}")
-        print(f"🚫 최대 스프레드: {self.config.arbitrage.max_spread_threshold:.1f}% (이상치 필터링)")
+        print(f"🚫 최대 스프레드: {self.config.arbitrage.max_spread_threshold*100:.1f}% (이상치 필터링)")
         print(f"📈 프리미엄 감지: {'✅' if self.config.arbitrage.premium_detection.enabled else '❌'}")
         print()
     
@@ -438,34 +438,51 @@ class ArBot:
                 continue
             
             try:
+                # Check for valid API credentials
+                # Allow demo mode with dummy credentials for simulation
+                if not exchange_config.api_key or not exchange_config.api_secret:
+                    if self.config.trading_mode.value == 'simulation':
+                        logger.info(f"🎮 {exchange_name} using demo credentials for simulation mode")
+                        # Use dummy credentials for simulation mode
+                        api_key = exchange_config.api_key or 'demo_api_key'
+                        api_secret = exchange_config.api_secret or 'demo_api_secret'
+                    else:
+                        logger.warning(f"⚠️ {exchange_name} has empty API credentials, skipping initialization")
+                        continue
+                else:
+                    api_key = exchange_config.api_key
+                    api_secret = exchange_config.api_secret
+                
                 if exchange_name == 'binance':
                     exchange = BinanceExchange(
-                        exchange_config.api_key,
-                        exchange_config.api_secret,
+                        api_key,
+                        api_secret,
                         exchange_config.testnet
                     )
                 elif exchange_name == 'bybit':
                     exchange = BybitExchange(
-                        exchange_config.api_key,
-                        exchange_config.api_secret,
+                        api_key,
+                        api_secret,
                         exchange_config.testnet
                     )
                 elif exchange_name == 'bitget':
                     exchange = BitgetExchange(
-                        exchange_config.api_key,
-                        exchange_config.api_secret,
+                        api_key,
+                        api_secret,
                         exchange_config.testnet
                     )
                 elif exchange_name == 'okx':
                     exchange = OKXExchange(
-                        exchange_config.api_key,
-                        exchange_config.api_secret,
+                        api_key,
+                        api_secret,
                         exchange_config.testnet
                     )
                 else:
                     logger.warning(f"⚠️ 알 수 없는 거래소: {exchange_name}")
                     continue
                 
+                # Set exchange name for identification
+                exchange.exchange_name = exchange_name
                 self.exchanges[exchange_name] = exchange
                 print(f"✅ {exchange_name.upper()} 거래소 연결 완료")
                 
@@ -478,146 +495,153 @@ class ArBot:
         
         print(f"🎯 총 {len(self.exchanges)}개 거래소 연결 완료")
     
+    def _filter_symbols_for_exchange(self, symbols: List[str], exchange_name: str) -> List[str]:
+        """Filter out problematic symbols for specific exchanges"""
+        if exchange_name.lower() == 'bybit':
+            # Symbols known to cause issues on Bybit
+            problematic_symbols = {
+                'MLNUSDT', 'DEXEUSDT', 'STORJUSDT', 'KNCUSDT', 'BANDUSDT', 
+                'CTKUSDT', 'RSRUSDT', 'RLCUSDT', 'BNTUSDT', 'ALPINEUSDT',
+                'CITYUSDT', 'SANTOSUSDT', 'IBUSDT', 'DREPUSDT', 'WNXMUSDT',
+                'TWTUSDT', 'STRAXUSDT', 'FISUSDT', 'OXTUSDT', 'MDTUSDT'
+            }
+            return [s for s in symbols if s not in problematic_symbols]
+        elif exchange_name.lower() == 'binance':
+            # Filter symbols that might have low liquidity or trading issues
+            return symbols  # Binance generally has good symbol support
+        else:
+            return symbols
+    
+    def _get_fallback_symbols_for_exchange(self, exchange_name: str) -> List[str]:
+        """Get fallback symbols for a specific exchange"""
+        # Use the most common and liquid USDT pairs as fallback
+        common_symbols = [
+            'BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'SOLUSDT', 'ADAUSDT', 'AVAXUSDT',
+            'DOGEUSDT', 'MATICUSDT', 'LINKUSDT', 'LTCUSDT', 'UNIUSDT', 'ATOMUSDT',
+            'DOTUSDT', 'BCHUSDT', 'ETCUSDT', 'FILUSDT', 'TRXUSDT', 'XLMUSDT',
+            'VETUSDT', 'ICPUSDT', 'FTMUSDT', 'THETAUSDT', 'HBARUSDT', 'EOSUSDT'
+        ]
+        
+        if exchange_name.lower() == 'bybit':
+            # Remove symbols known to be problematic on Bybit
+            safe_symbols = [s for s in common_symbols if s not in {
+                'MLNUSDT', 'DEXEUSDT', 'STORJUSDT', 'KNCUSDT', 'BANDUSDT'
+            }]
+            return safe_symbols
+        else:
+            return common_symbols
+    
     async def get_common_symbols_with_volume(self) -> List[str]:
-        """Get common symbols across arbitrage exchanges with minimum volume"""
-        arbitrage_exchanges = self.config.get_arbitrage_exchanges()
-        if len(arbitrage_exchanges) < 2:
-            print("⚠️ 차익거래용 거래소가 2개 미만입니다")
-            return self.config.arbitrage.symbols
+        """Dynamically detect common symbols across exchanges"""
+        if len(self.exchanges) < 1:
+            logger.warning("Need at least 1 exchange for symbol detection")
+            return ["BTCUSDT", "ETHUSDT"]  # Fallback to basic symbols
         
-        print("🔍 공통 심볼 및 볼륨 검사 중...")
+        logger.info(f"Detecting symbols from {len(self.exchanges)} exchanges: {list(self.exchanges.keys())}")
         
-        # Get symbols and volumes from each exchange
+        # Get available symbols from all exchanges
         exchange_symbols = {}
-        exchange_volumes = {}
         
-        for exchange_name in arbitrage_exchanges:
-            exchange = self.exchanges.get(exchange_name)
-            if not exchange:
-                print(f"⚠️ {exchange_name} 거래소 객체를 찾을 수 없습니다")
-                continue
-            
-            # Check if exchange has API credentials
-            config = self.config.exchanges.get(exchange_name)
-            if config and not config.api_key:
-                print(f"⚠️ {exchange_name} API 키가 설정되지 않았습니다")
-                
+        for exchange_name, exchange in self.exchanges.items():
             try:
-                # Get all tickers with volume info
-                tickers = await exchange.get_all_tickers()
-                if tickers:
-                    symbols = set()
-                    volumes = {}
-                    
-                    for ticker in tickers:
-                        symbol = ticker.get('symbol')
-                        if not symbol:
-                            continue
+                logger.info(f"Getting available symbols from {exchange_name}...")
+                
+                # Use get_symbols method if available, otherwise try get_all_tickers
+                if hasattr(exchange, 'get_symbols'):
+                    symbols = await asyncio.wait_for(exchange.get_symbols(), timeout=10.0)
+                    if symbols:
+                        # Filter for USDT pairs only
+                        usdt_symbols = [s for s in symbols if s.endswith('USDT')]
+                        exchange_symbols[exchange_name] = set(usdt_symbols)
+                        logger.info(f"{exchange_name}: Found {len(usdt_symbols)} USDT pairs")
+                    else:
+                        logger.warning(f"{exchange_name}: get_symbols returned empty")
+                else:
+                    # Fallback to get_all_tickers
+                    tickers = await asyncio.wait_for(exchange.get_all_tickers(), timeout=30.0)
+                    if tickers:
+                        symbols = [ticker.get('symbol') for ticker in tickers if ticker.get('symbol')]
+                        # Filter for USDT pairs and remove invalid symbols
+                        usdt_symbols = [s for s in symbols if s.endswith('USDT')]
+                        # Remove known problematic symbols for specific exchanges
+                        filtered_symbols = self._filter_symbols_for_exchange(usdt_symbols, exchange_name)
+                        exchange_symbols[exchange_name] = set(filtered_symbols)
+                        logger.info(f"{exchange_name}: Found {len(filtered_symbols)} valid USDT pairs")
+                    else:
+                        logger.warning(f"{exchange_name}: get_all_tickers returned empty")
                         
-                        # Extract volume (24h in USDT)
-                        volume_usdt = 0
-                        try:
-                            if exchange_name.lower() == 'bybit':
-                                volume_usdt = float(ticker.get('turnover24h', 0))
-                            elif exchange_name.lower() == 'binance':
-                                # For Binance, use quoteVolume which is already in USDT
-                                volume_usdt = float(ticker.get('quoteVolume', 0))
-                                if volume_usdt == 0:
-                                    # Fallback: calculate volume * price
-                                    volume = float(ticker.get('volume', 0))
-                                    price = float(ticker.get('weightedAvgPrice', 0)) or float(ticker.get('lastPrice', 0))
-                                    volume_usdt = volume * price
-                            elif exchange_name.lower() == 'okx':
-                                # OKX uses volCcy24h for volume in quote currency
-                                volume_usdt = float(ticker.get('volCcy24h', 0))
-                            elif exchange_name.lower() == 'bitget':
-                                # Bitget uses quoteVol (not quoteVolume)
-                                volume_usdt = float(ticker.get('quoteVol', 0))
-                                if volume_usdt == 0:
-                                    volume = float(ticker.get('baseVol', 0))
-                                    price = float(ticker.get('close', 0)) or float(ticker.get('lastPrice', 0))
-                                    volume_usdt = volume * price
-                            else:
-                                # Default calculation
-                                volume = float(ticker.get('volume24h', 0)) or float(ticker.get('volume', 0))
-                                price = float(ticker.get('lastPrice', 0))
-                                volume_usdt = volume * price
-                        except (ValueError, TypeError):
-                            volume_usdt = 0
-                        
-                        # Include symbols with valid volume data and enabled quote currency
-                        if volume_usdt > 0 and self._is_symbol_enabled(symbol):
-                            symbols.add(symbol)
-                            volumes[symbol] = volume_usdt
-                    
-                    exchange_symbols[exchange_name] = symbols
-                    exchange_volumes[exchange_name] = volumes
-                    print(f"✅ {exchange_name}: {len(symbols)}개 심볼 발견")
-                    
             except Exception as e:
-                print(f"❌ {exchange_name} 심볼 조회 실패: {e}")
-                continue
+                logger.error(f"Failed to get symbols from {exchange_name}: {e}")
+                # Use fallback symbols for this exchange
+                fallback_symbols = self._get_fallback_symbols_for_exchange(exchange_name)
+                exchange_symbols[exchange_name] = set(fallback_symbols)
+                logger.warning(f"{exchange_name}: Using fallback symbols ({len(fallback_symbols)} symbols)")
         
         if not exchange_symbols:
-            print("⚠️ 심볼 데이터를 가져올 수 없습니다. 기본 설정 사용")
-            return self.config.arbitrage.symbols
+            logger.error("Failed to get symbols from any exchange")
+            return ["BTCUSDT", "ETHUSDT"]
         
-        # Find common symbols
-        common_symbols = None
-        for exchange_name, symbols in exchange_symbols.items():
-            if common_symbols is None:
-                common_symbols = symbols.copy()
-            else:
-                common_symbols &= symbols
-        
-        if not common_symbols:
-            print("⚠️ 공통 심볼이 없습니다. 기본 설정 사용")
-            return self.config.arbitrage.symbols
-        
-        # Sort by average volume across exchanges
-        symbol_avg_volumes = {}
-        for symbol in common_symbols:
-            volumes = [exchange_volumes[ex].get(symbol, 0) for ex in exchange_volumes]
-            symbol_avg_volumes[symbol] = sum(volumes) / len(volumes)
-        
-        # Sort by volume descending and take top 200
-        sorted_symbols = sorted(symbol_avg_volumes.keys(), 
-                              key=lambda s: symbol_avg_volumes[s], reverse=True)
-        
-        # Limit to configured max symbols for performance and relevance  
-        max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
-        final_symbols = sorted_symbols[:max_symbols]
-        
-        print(f"🎯 공통 심볼 {len(sorted_symbols)}개 발견, 상위 {len(final_symbols)}개 선택")
-        
-        # Show top 20 symbols by volume
-        top_symbols = final_symbols[:20]
-        for i, symbol in enumerate(top_symbols, 1):
-            volume = symbol_avg_volumes[symbol]
-            print(f"  {i:2}. {symbol}: ${volume:,.0f}")
-        
-        if len(final_symbols) > 20:
-            print(f"  ... and {len(final_symbols) - 20} more symbols")
+        # Determine symbols based on number of exchanges
+        if len(self.exchanges) == 1:
+            # Single exchange: use all available symbols
+            exchange_name = list(self.exchanges.keys())[0]
+            all_symbols = list(exchange_symbols.get(exchange_name, set()))
             
-        # Show volume range
-        if final_symbols:
-            highest_volume = symbol_avg_volumes[final_symbols[0]]
-            lowest_volume = symbol_avg_volumes[final_symbols[-1]]
-            print(f"📊 볼륨 범위: ${lowest_volume:,.0f} ~ ${highest_volume:,.0f}")
+            # Limit to max_symbols for performance
+            max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+            final_symbols = all_symbols[:max_symbols]
+            
+            logger.info(f"Single exchange mode: Using {len(final_symbols)} symbols from {exchange_name}")
+            return final_symbols
         
-        return final_symbols
+        else:
+            # Multiple exchanges: find common symbols
+            common_symbols = None
+            for exchange_name, symbols in exchange_symbols.items():
+                if common_symbols is None:
+                    common_symbols = symbols.copy()
+                else:
+                    common_symbols &= symbols
+            
+            if not common_symbols:
+                logger.warning("No common symbols found across exchanges")
+                # Use symbols from the first exchange as fallback
+                first_exchange = list(exchange_symbols.keys())[0]
+                fallback_symbols = list(exchange_symbols[first_exchange])
+                max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+                final_symbols = fallback_symbols[:max_symbols]
+                logger.info(f"Using {len(final_symbols)} symbols from {first_exchange} as fallback")
+                return final_symbols
+            
+            # Sort common symbols alphabetically for consistency
+            sorted_symbols = sorted(list(common_symbols))
+            
+            # Limit to max_symbols for performance
+            max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+            final_symbols = sorted_symbols[:max_symbols]
+            
+            logger.info(f"Found {len(sorted_symbols)} common symbols, using top {len(final_symbols)}")
+            
+            # Log some example symbols
+            if final_symbols:
+                example_symbols = final_symbols[:10]
+                logger.info(f"Example symbols: {', '.join(example_symbols)}")
+            
+            return final_symbols
     
     async def start(self):
         """Start the trading bot"""
         try:
             print("🚀 ArBot 거래 시작...")
             
-            # Get dynamic symbols if enabled
-            if self.config.arbitrage.use_dynamic_symbols:
-                self.dynamic_symbols = await self.get_common_symbols_with_volume()
-            else:
-                self.dynamic_symbols = self.config.arbitrage.symbols
-                print(f"📋 설정된 심볼 사용: {len(self.dynamic_symbols)}개")
+            # Always use dynamic symbols detection for better exchange compatibility
+            print("🔍 거래소별 지원 심볼 자동 감지 중...")
+            self.dynamic_symbols = await self.get_common_symbols_with_volume()
+            
+            # Log comparison with config for reference
+            config_symbols = self.config.arbitrage.symbols if hasattr(self.config.arbitrage, 'symbols') else []
+            if config_symbols:
+                print(f"📋 설정 심볼 {len(config_symbols)}개 → 동적 감지 심볼 {len(self.dynamic_symbols)}개로 변경")
             
             # Update strategy with dynamic symbols
             self.strategy.set_active_symbols(self.dynamic_symbols)
@@ -899,9 +923,10 @@ async def main():
         
         # Run based on mode
         if args.mode == 'ui':
-            # Run GUI
-            database = Database(config.database.db_path)
-            await run_gui(config, database)
+            # Run GUI with initialized bot (exchanges not yet connected to WebSocket)
+            print("🖥️ UI 모드로 실행 중...")
+            print(f"🏪 전달된 거래소: {list(bot.exchanges.keys())}")
+            await run_gui(config, bot.database, bot.exchanges)
         
         elif args.mode == 'backtest':
             # Run backtest

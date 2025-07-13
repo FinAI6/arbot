@@ -48,7 +48,7 @@ class ArbitrageConfig:
     slippage_tolerance: float = 0.001  # 0.1%
     max_spread_age_seconds: float = 5.0
     use_dynamic_symbols: bool = True
-    max_spread_threshold: float = 2.0  # Maximum spread percentage (200%) to filter out anomalies
+    max_spread_threshold: float = 1.0  # Maximum spread percentage (100%) to filter out anomalies
     
     # Symbol filtering by quote currency
     enabled_quote_currencies: List[str] = field(default_factory=lambda: ["USDT"])  # Enabled quote currencies
@@ -79,6 +79,11 @@ class DatabaseConfig:
     db_path: str = "data/arbot.db"
     backup_interval_hours: int = 24
     max_history_days: int = 30
+    store_ticker_data: bool = True
+    ticker_storage_mode: str = "batch"  # "individual" or "batch"
+    ticker_storage_interval_seconds: int = 60
+    ticker_batch_size: int = 100
+    ticker_batch_interval_seconds: int = 30
 
 
 @dataclass
@@ -209,7 +214,7 @@ class Config:
                 slippage_tolerance=arb_data.get('slippage_tolerance', 0.001),
                 max_spread_age_seconds=arb_data.get('max_spread_age_seconds', 5.0),
                 use_dynamic_symbols=arb_data.get('use_dynamic_symbols', True),
-                max_spread_threshold=arb_data.get('max_spread_threshold', 2.0),
+                max_spread_threshold=arb_data.get('max_spread_threshold', 1.0),
                 enabled_quote_currencies=arb_data.get('enabled_quote_currencies', ["USDT"]),
                 available_quote_currencies=arb_data.get('available_quote_currencies', ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"]),
                 moving_average_periods=arb_data.get('moving_average_periods', 30),
@@ -234,7 +239,9 @@ class Config:
             self.database = DatabaseConfig(
                 db_path=db_data.get('db_path', 'arbot.db'),
                 backup_interval_hours=db_data.get('backup_interval_hours', 24),
-                max_history_days=db_data.get('max_history_days', 30)
+                max_history_days=db_data.get('max_history_days', 30),
+                store_ticker_data=db_data.get('store_ticker_data', True),
+                ticker_storage_interval_seconds=db_data.get('ticker_storage_interval_seconds', 60)
             )
         
         if 'ui' in config_data:
@@ -344,7 +351,9 @@ class Config:
             'database': {
                 'db_path': self.database.db_path,
                 'backup_interval_hours': self.database.backup_interval_hours,
-                'max_history_days': self.database.max_history_days
+                'max_history_days': self.database.max_history_days,
+                'store_ticker_data': self.database.store_ticker_data,
+                'ticker_storage_interval_seconds': self.database.ticker_storage_interval_seconds
             },
             'ui': {
                 'refresh_rate_ms': self.ui.refresh_rate_ms,

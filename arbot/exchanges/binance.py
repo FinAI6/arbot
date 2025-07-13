@@ -3,11 +3,14 @@ import json
 import time
 import hmac
 import hashlib
+import logging
 from typing import Dict, List, Optional
 from urllib.parse import urlencode
 import aiohttp
 import websockets
 from .base import BaseExchange, Ticker, OrderBook, Order, Balance, OrderSide, OrderType, OrderStatus
+
+logger = logging.getLogger(__name__)
 
 
 class BinanceExchange(BaseExchange):
@@ -93,56 +96,285 @@ class BinanceExchange(BaseExchange):
     
     async def connect_ws(self, symbols: List[str]) -> None:
         self.symbols = symbols
-        stream_names = []
         
+        # Binance has a limit on streams per connection (200 streams max)
+        # Now that message format is fixed, restore to full capacity
+        max_symbols_per_connection = 200  # Full test with all 200 symbols as requested
+        
+        if len(symbols) > max_symbols_per_connection:
+            logger.warning(f"Binance WebSocket: Too many symbols ({len(symbols)}), limiting to {max_symbols_per_connection}")
+            print(f"⚠️ Binance 심볼 수 제한: {len(symbols)} → {max_symbols_per_connection}")
+            symbols = symbols[:max_symbols_per_connection]
+            self.symbols = symbols
+        
+        stream_names = []
         for symbol in symbols:
             symbol_lower = symbol.lower()
             stream_names.append(f"{symbol_lower}@ticker")
-            stream_names.append(f"{symbol_lower}@depth5")
+            # Only use ticker stream to reduce connection load
+            # stream_names.append(f"{symbol_lower}@depth5")
         
         stream_url = f"{self.ws_url}/{'/'.join(stream_names)}"
         
+        # Debug: Log WebSocket URL and stream configuration
+        logger.info(f"Binance WebSocket URL length: {len(stream_url)} characters")
+        logger.info(f"Binance WebSocket URL: {stream_url[:200]}{'...' if len(stream_url) > 200 else ''}")
+        logger.info(f"Binance subscribing to {len(stream_names)} streams for {len(symbols)} symbols")
+        logger.info(f"First few streams: {stream_names[:5]}")
+        
+        # Check if URL is too long (Binance has limits)
+        if len(stream_url) > 8000:  # Conservative limit
+            logger.warning(f"⚠️ Binance WebSocket URL is very long ({len(stream_url)} chars), may cause connection issues")
+        
         try:
-            self.ws_connection = await websockets.connect(stream_url)
+            self.ws_connection = await websockets.connect(
+                stream_url,
+                ping_interval=20,  # 20초마다 ping
+                ping_timeout=10,   # ping 응답 대기 시간
+                close_timeout=10   # 연결 종료 대기 시간
+            )
             self.connected = True
+            
+            # Show subscription completion message like Bybit
+            print(f"✅ Binance 구독 완료: {len(symbols)}개 심볼 (총 {len(stream_names)}개 채널)")
+            logger.info(f"✅ Binance WebSocket connected with {len(symbols)} symbols and {len(stream_names)} streams")
+            
+            # Start with simple message handling first, add reconnection later if needed
+            logger.info("🔄 About to start Binance WebSocket message handler task...")
             self._ws_task = asyncio.create_task(self._handle_ws_messages())
+            logger.info(f"✅ Binance WebSocket message handler task created: {self._ws_task}")
+            
+            # Give the task a moment to start
+            await asyncio.sleep(0.1)
+            logger.info(f"📊 Binance WebSocket task state after 0.1s: {self._ws_task.done()}")
         except Exception as e:
-            print(f"Failed to connect to Binance WebSocket: {e}")
+            logger.error(f"❌ Failed to connect to Binance WebSocket: {e}")
+            print(f"❌ Binance WebSocket 연결 실패: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             self.connected = False
     
     async def disconnect_ws(self) -> None:
+        """Properly disconnect WebSocket with cleanup"""
+        self.connected = False  # Signal to stop reconnection attempts
+        
         if self._ws_task:
             self._ws_task.cancel()
             try:
                 await self._ws_task
             except asyncio.CancelledError:
                 pass
+            self._ws_task = None
         
         if self.ws_connection:
-            await self.ws_connection.close()
-            self.ws_connection = None
+            try:
+                await self.ws_connection.close()
+            except Exception as e:
+                logger.warning(f"Error closing Binance WebSocket connection: {e}")
+            finally:
+                self.ws_connection = None
         
-        self.connected = False
+        logger.info("Binance WebSocket disconnected")
     
-    async def _handle_ws_messages(self) -> None:
-        try:
-            async for message in self.ws_connection:
-                data = json.loads(message)
-                
-                if 'stream' in data:
-                    stream = data['stream']
-                    stream_data = data['data']
+    async def _handle_ws_messages_with_reconnect(self) -> None:
+        """Handle WebSocket messages with automatic reconnection"""
+        max_retries = 10
+        retry_count = 0
+        base_delay = 1
+        max_delay = 60
+        
+        while self.connected or retry_count == 0:
+            try:
+                # If this is a reconnection attempt, recreate the WebSocket connection
+                if retry_count > 0:
+                    stream_names = []
+                    for symbol in self.symbols:
+                        symbol_lower = symbol.lower()
+                        stream_names.append(f"{symbol_lower}@ticker")
                     
-                    if '@ticker' in stream:
-                        await self._handle_ticker_data(stream_data)
-                    elif '@depth' in stream:
-                        await self._handle_depth_data(stream_data)
+                    stream_url = f"{self.ws_url}/{'/'.join(stream_names)}"
+                    
+                    self.ws_connection = await websockets.connect(
+                        stream_url,
+                        ping_interval=20,
+                        ping_timeout=10,
+                        close_timeout=10
+                    )
+                    logger.info(f"Binance WebSocket reconnected successfully (attempt {retry_count})")
+                
+                # Reset retry count on successful connection
+                retry_count = 0
+                self.connected = True
+                
+                # Process messages
+                async for message in self.ws_connection:
+                    if not self.connected:
+                        break
+                        
+                    try:
+                        data = json.loads(message)
+                        
+                        if 'stream' in data:
+                            stream = data['stream']
+                            stream_data = data['data']
+                            
+                            if '@ticker' in stream:
+                                # Debug: Log first few ticker messages to verify reception
+                                if not hasattr(self, '_binance_ticker_debug_count'):
+                                    self._binance_ticker_debug_count = 0
+                                self._binance_ticker_debug_count += 1
+                                
+                                if self._binance_ticker_debug_count <= 3:
+                                    logger.info(f"🟢 Binance WebSocket ticker #{self._binance_ticker_debug_count}: {stream_data.get('s')} = {stream_data.get('b')}/{stream_data.get('a')}")
+                                elif self._binance_ticker_debug_count == 4:
+                                    logger.info("🟢 Binance WebSocket ticker reception confirmed (continuing...)")
+                                
+                                await self._handle_ticker_data(stream_data)
+                            elif '@depth' in stream:
+                                await self._handle_depth_data(stream_data)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Binance WebSocket: Failed to parse message: {e}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Binance WebSocket: Error handling message: {e}")
+                        continue
+                        
+            except websockets.exceptions.ConnectionClosed as e:
+                if not self.connected:
+                    logger.info("Binance WebSocket connection closed by user")
+                    break
+                logger.warning(f"Binance WebSocket connection closed: {e}")
+                
+            except websockets.exceptions.WebSocketException as e:
+                logger.warning(f"Binance WebSocket exception: {e}")
+                
+            except (OSError, ConnectionError, asyncio.TimeoutError) as e:
+                logger.warning(f"Binance WebSocket network error: {e}")
+                
+            except Exception as e:
+                logger.error(f"Binance WebSocket unexpected error: {e}")
+            
+            # Reconnection logic
+            if not self.connected:
+                break
+                
+            retry_count += 1
+            if retry_count > max_retries:
+                logger.error(f"Binance WebSocket failed to reconnect after {max_retries} attempts")
+                self.connected = False
+                break
+            
+            # Exponential backoff
+            delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
+            logger.info(f"Binance WebSocket reconnecting in {delay:.2f} seconds (attempt {retry_count}/{max_retries})")
+            await asyncio.sleep(delay)
+        
+        logger.info("Binance WebSocket connection permanently closed")
+        self.connected = False
+
+    async def _handle_ws_messages(self) -> None:
+        """Simple WebSocket message handler with debugging"""
+        logger.info("🔄 Binance WebSocket message handler started")
+        print("🔄 Binance WebSocket 메시지 핸들러 시작됨")
+        
+        message_count = 0
+        try:
+            logger.info("📡 Starting to listen for Binance WebSocket messages...")
+            async for message in self.ws_connection:
+                message_count += 1
+                
+                if message_count <= 3:
+                    logger.info(f"📨 Binance message #{message_count} received (length: {len(message)})")
+                elif message_count == 4:
+                    logger.info("📨 Binance message reception confirmed (continuing silently...)")
+                
+                if not self.connected:
+                    logger.info("Binance WebSocket disconnection requested")
+                    break
+                    
+                try:
+                    data = json.loads(message)
+                    
+                    # Debug: Log message structure for first few messages
+                    if message_count <= 3:
+                        logger.info(f"🔍 Binance message #{message_count} structure: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
+                        if isinstance(data, dict):
+                            if 'stream' in data:
+                                logger.info(f"  Stream: {data['stream']}")
+                                logger.info(f"  Data keys: {list(data['data'].keys()) if 'data' in data and isinstance(data['data'], dict) else 'no data'}")
+                            else:
+                                logger.info(f"  No 'stream' key, keys are: {list(data.keys())}")
+                    
+                    # Handle both combined stream format and individual stream format
+                    if 'stream' in data:
+                        # Combined stream format: {'stream': 'btcusdt@ticker', 'data': {...}}
+                        stream = data['stream']
+                        stream_data = data['data']
+                        
+                        if '@ticker' in stream:
+                            if not hasattr(self, '_binance_ticker_debug_count'):
+                                self._binance_ticker_debug_count = 0
+                            self._binance_ticker_debug_count += 1
+                            
+                            if self._binance_ticker_debug_count <= 3:
+                                logger.info(f"🟢 Binance WebSocket ticker (combined) #{self._binance_ticker_debug_count}: {stream_data.get('s')} = {stream_data.get('b')}/{stream_data.get('a')}")
+                            elif self._binance_ticker_debug_count == 4:
+                                logger.info("🟢 Binance WebSocket ticker reception confirmed (continuing...)")
+                            
+                            await self._handle_ticker_data(stream_data)
+                        elif '@depth' in stream:
+                            await self._handle_depth_data(stream_data)
+                        else:
+                            if message_count <= 3:
+                                logger.info(f"📊 Binance stream type: {stream} (not ticker or depth)")
+                    
+                    elif 'e' in data and data.get('e') == '24hrTicker':
+                        # Individual ticker format: {'e': '24hrTicker', 's': 'BTCUSDT', 'b': '...', ...}
+                        if not hasattr(self, '_binance_ticker_debug_count'):
+                            self._binance_ticker_debug_count = 0
+                        self._binance_ticker_debug_count += 1
+                        
+                        if self._binance_ticker_debug_count <= 3:
+                            logger.info(f"🟢 Binance WebSocket ticker (individual) #{self._binance_ticker_debug_count}: {data.get('s')} = {data.get('b')}/{data.get('a')}")
+                            print(f"🟢 Binance ticker #{self._binance_ticker_debug_count}: {data.get('s')} = {data.get('b')}/{data.get('a')}")
+                        elif self._binance_ticker_debug_count == 4:
+                            logger.info("🟢 Binance WebSocket ticker reception confirmed (continuing...)")
+                            print("🟢 Binance WebSocket ticker 수신 정상 (계속 수신 중...)")
+                        
+                        await self._handle_ticker_data(data)
+                    
+                    else:
+                        # Unknown message format
+                        if message_count <= 3:
+                            logger.info(f"⚠️ Binance WebSocket: Unknown message format: {str(data)[:200]}")
+                        else:
+                            logger.debug(f"Binance WebSocket: Unexpected message format: {message[:100]}")
+                        
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Binance WebSocket: Failed to parse message: {e}")
+                    if message_count <= 3:
+                        logger.warning(f"Raw message: {message[:200]}")
+                except Exception as e:
+                    logger.error(f"Binance WebSocket: Error processing message: {e}")
+                    if message_count <= 3:
+                        import traceback
+                        logger.error(f"Processing error traceback: {traceback.format_exc()}")
                         
         except Exception as e:
-            print(f"WebSocket error: {e}")
+            logger.error(f"Binance WebSocket connection error: {e}")
             self.connected = False
+        finally:
+            logger.info("🔄 Binance WebSocket message handler ended")
     
     async def _handle_ticker_data(self, data: Dict) -> None:
+        # Debug first few ticker data processes
+        if not hasattr(self, '_ticker_data_debug_count'):
+            self._ticker_data_debug_count = 0
+        self._ticker_data_debug_count += 1
+        
+        if self._ticker_data_debug_count <= 2:
+            logger.info(f"🎯 Binance _handle_ticker_data #{self._ticker_data_debug_count}: {data.get('s')} = {data.get('b')}/{data.get('a')}")
+        
         ticker = Ticker(
             symbol=data['s'],
             bid=float(data['b']),
@@ -151,7 +383,14 @@ class BinanceExchange(BaseExchange):
             ask_size=float(data['A']),
             timestamp=float(data['E']) / 1000
         )
+        
+        if self._ticker_data_debug_count <= 2:
+            logger.info(f"🚀 Binance about to emit ticker #{self._ticker_data_debug_count}: {ticker.symbol}")
+            
         await self._emit_ticker(ticker)
+        
+        if self._ticker_data_debug_count <= 2:
+            logger.info(f"✅ Binance ticker #{self._ticker_data_debug_count} emitted successfully")
     
     async def _handle_depth_data(self, data: Dict) -> None:
         orderbook = OrderBook(

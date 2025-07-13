@@ -85,7 +85,10 @@ class BybitExchange(BaseExchange):
         
         request_params = {}
         if method == 'GET':
-            request_params['params'] = params
+            # For signed GET requests, params are already in the URL
+            # For unsigned GET requests, pass params separately
+            if not signed:
+                request_params['params'] = params
         else:
             request_params['json'] = params
         
@@ -112,7 +115,15 @@ class BybitExchange(BaseExchange):
                         'X-BAPI-SIGN': signature
                     })
                     
-                    async with session.request(method, url, headers=headers, **request_params) as retry_response:
+                    # For retry, use same request_params logic
+                    retry_request_params = {}
+                    if method == 'GET':
+                        if not signed:
+                            retry_request_params['params'] = params
+                    else:
+                        retry_request_params['json'] = params
+                    
+                    async with session.request(method, url, headers=headers, **retry_request_params) as retry_response:
                         retry_data = await retry_response.json()
                         if retry_data.get('retCode') != 0:
                             raise Exception(f"Bybit API error: {retry_data}")
@@ -197,7 +208,24 @@ class BybitExchange(BaseExchange):
                                 symbol_count = len(self.symbols) if hasattr(self, 'symbols') else 0
                                 print(f"✅ Bybit 구독 완료: {symbol_count}개 심볼 (총 {self._subscription_count}개 채널)")
                         else:
-                            print(f"⚠️ Bybit 구독: {data.get('ret_msg', 'unknown')}")
+                            # Parse subscription error details
+                            ret_msg = data.get('ret_msg', 'unknown')
+                            if 'Invalid symbol' in ret_msg:
+                                # Extract symbol name from error message
+                                import re
+                                symbol_match = re.search(r'\[(.*?)\]', ret_msg)
+                                if symbol_match:
+                                    failed_channel = symbol_match.group(1)
+                                    # Extract symbol from channel (e.g., tickers.IOTAUSDT -> IOTAUSDT)
+                                    if '.' in failed_channel:
+                                        symbol = failed_channel.split('.')[-1]
+                                        print(f"⚠️ Bybit 구독 실패: Invalid symbol [{symbol}]")
+                                    else:
+                                        print(f"⚠️ Bybit 구독 실패: {ret_msg}")
+                                else:
+                                    print(f"⚠️ Bybit 구독 실패: {ret_msg}")
+                            else:
+                                print(f"⚠️ Bybit 구독: {ret_msg}")
                     elif 'ret_msg' in data:
                         # Error message
                         print(f"❌ Bybit 오류: {data.get('ret_msg', 'unknown error')}")

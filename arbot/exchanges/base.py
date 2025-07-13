@@ -71,6 +71,7 @@ class BaseExchange(ABC):
         self.connected = False
         self.symbols: List[str] = []
         self._callbacks: Dict[str, List[callable]] = {}
+        self.exchange_name: str = ""  # Will be set when exchange is created
     
     @abstractmethod
     async def connect_ws(self, symbols: List[str]) -> None:
@@ -148,12 +149,30 @@ class BaseExchange(ABC):
     
     async def _emit_ticker(self, ticker: Ticker) -> None:
         """Emit ticker update to registered callbacks"""
+        # Debug for Binance specifically
+        if hasattr(self, '__class__') and 'Binance' in self.__class__.__name__:
+            if not hasattr(self, '_emit_debug_count'):
+                self._emit_debug_count = 0
+            self._emit_debug_count += 1
+            
+            if self._emit_debug_count <= 2:
+                callback_count = len(self._callbacks.get('ticker', []))
+                print(f"🔔 Binance _emit_ticker #{self._emit_debug_count}: {ticker.symbol}, {callback_count} callbacks")
+        
         if 'ticker' in self._callbacks:
-            for callback in self._callbacks['ticker']:
+            for i, callback in enumerate(self._callbacks['ticker']):
                 try:
                     await callback(ticker)
+                    
+                    # Debug callback execution for Binance
+                    if hasattr(self, '__class__') and 'Binance' in self.__class__.__name__ and hasattr(self, '_emit_debug_count') and self._emit_debug_count <= 2:
+                        print(f"✅ Binance callback #{i+1} executed successfully for {ticker.symbol}")
+                        
                 except Exception as e:
-                    print(f"Error in ticker callback: {e}")
+                    print(f"❌ Error in ticker callback #{i+1}: {e}")
+                    if hasattr(self, '__class__') and 'Binance' in self.__class__.__name__:
+                        import traceback
+                        print(f"Callback traceback: {traceback.format_exc()}")
     
     async def _emit_orderbook(self, orderbook: OrderBook) -> None:
         """Emit orderbook update to registered callbacks"""

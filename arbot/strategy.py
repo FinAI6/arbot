@@ -69,66 +69,104 @@ class ArbitrageStrategy:
         """Initialize strategy with exchanges"""
         logger.info("Initializing arbitrage strategy")
         
-        # Load trading fees for each exchange
-        for exchange_name, exchange in exchanges.items():
+        # Store exchanges reference for fee loading
+        self.exchanges = exchanges
+        
+        # Initialize exchange fees structure (will be loaded on-demand)
+        for exchange_name in exchanges.keys():
             self.exchange_fees[exchange_name] = {}
-            for symbol in self.active_symbols:
-                try:
-                    fees = await exchange.get_trading_fees(symbol)
-                    
-                    # Validate fee structure
-                    if not fees or not isinstance(fees, dict):
-                        print(f"Invalid fee structure for {exchange_name} {symbol}, using defaults")
-                        fees = {'maker': 0.001, 'taker': 0.001}
-                    
-                    # Ensure required keys exist
-                    if 'maker' not in fees or 'taker' not in fees:
-                        print(f"Missing fee keys for {exchange_name} {symbol}, using defaults")
-                        fees = {'maker': 0.001, 'taker': 0.001}
-                    
+        
+        logger.info("Trading fees will be loaded on-demand to avoid rate limits")
+        
+        # Set up ticker callbacks with exchange name closure
+        for exchange_name, exchange in exchanges.items():
+            # Create a closure to capture exchange name
+            def create_ticker_callback(exchange_name):
+                async def callback(ticker):
+                    await self._on_ticker_update(ticker, exchange_name)
+                return callback
+            
+            exchange.on_ticker(create_ticker_callback(exchange_name))
+        
+        logger.info("Arbitrage strategy initialized")
+    
+    async def get_trading_fees(self, exchange_name: str, symbol: str) -> Dict[str, float]:
+        """Get trading fees for exchange and symbol with caching"""
+        # Check if already loaded in memory
+        if exchange_name in self.exchange_fees and symbol in self.exchange_fees[exchange_name]:
+            return self.exchange_fees[exchange_name][symbol]
+        
+        # Check database cache first
+        try:
+            cached_fee = await self.database.get_trading_fee(exchange_name, symbol)
+            if cached_fee:
+                # Check if cache is fresh (within 24 hours)
+                if time.time() - cached_fee.timestamp < 24 * 3600:
+                    fees = {'maker': cached_fee.maker_fee, 'taker': cached_fee.taker_fee}
+                    self.exchange_fees[exchange_name][symbol] = fees
+                    logger.debug(f"Using cached fees for {exchange_name} {symbol}: {fees}")
+                    return fees
+        except Exception as e:
+            logger.warning(f"Error checking cached fees for {exchange_name} {symbol}: {e}")
+        
+        # Load from exchange API and cache it
+        try:
+            exchange = self.exchanges.get(exchange_name)
+            if not exchange:
+                logger.warning(f"Exchange {exchange_name} not found, using default fees")
+                fees = {'maker': 0.001, 'taker': 0.001}
+            else:
+                fees = await exchange.get_trading_fees(symbol)
+                
+                # Validate fee structure
+                if not fees or not isinstance(fees, dict):
+                    logger.warning(f"Invalid fee structure for {exchange_name} {symbol}, using defaults")
+                    fees = {'maker': 0.001, 'taker': 0.001}
+                else:
                     # Validate fee values
                     try:
                         maker_fee = float(fees.get('maker', 0.001))
                         taker_fee = float(fees.get('taker', 0.001))
-                        fees = {'maker': maker_fee, 'taker': taker_fee}
+                        
+                        # Sanity check: fees should be between 0 and 10%
+                        if not (0 <= maker_fee <= 0.1) or not (0 <= taker_fee <= 0.1):
+                            logger.warning(f"Invalid fee range for {exchange_name} {symbol}, using defaults")
+                            fees = {'maker': 0.001, 'taker': 0.001}
+                        else:
+                            fees = {'maker': maker_fee, 'taker': taker_fee}
                     except (ValueError, TypeError):
-                        print(f"Invalid fee values for {exchange_name} {symbol}, using defaults")
+                        logger.warning(f"Invalid fee values for {exchange_name} {symbol}, using defaults")
                         fees = {'maker': 0.001, 'taker': 0.001}
-                    
-                    self.exchange_fees[exchange_name][symbol] = fees
-                    logger.info(f"Loaded fees for {exchange_name} {symbol}: {fees}")
-                    
+                
+                # Cache in database
+                try:
+                    from .database import TradingFeeRecord
+                    fee_record = TradingFeeRecord(
+                        exchange=exchange_name,
+                        symbol=symbol,
+                        maker_fee=fees['maker'],
+                        taker_fee=fees['taker'],
+                        timestamp=time.time()
+                    )
+                    await self.database.insert_or_update_trading_fee(fee_record)
+                    logger.info(f"Cached trading fees for {exchange_name} {symbol}: {fees}")
                 except Exception as e:
-                    logger.error(f"Failed to load fees for {exchange_name} {symbol}: {e}")
-                    # Default fees if unable to fetch
-                    self.exchange_fees[exchange_name][symbol] = {'maker': 0.001, 'taker': 0.001}
-        
-        # Set up ticker callbacks
-        for exchange_name, exchange in exchanges.items():
-            exchange.on_ticker(self._on_ticker_update)
-        
-        logger.info("Arbitrage strategy initialized")
+                    logger.warning(f"Error caching fees for {exchange_name} {symbol}: {e}")
+            
+            # Store in memory cache
+            self.exchange_fees[exchange_name][symbol] = fees
+            return fees
+            
+        except Exception as e:
+            logger.error(f"Error loading fees for {exchange_name} {symbol}: {e}")
+            # Return default fees
+            fees = {'maker': 0.001, 'taker': 0.001}
+            self.exchange_fees[exchange_name][symbol] = fees
+            return fees
     
-    async def _on_ticker_update(self, ticker: Ticker) -> None:
+    async def _on_ticker_update(self, ticker: Ticker, exchange_name: str) -> None:
         """Handle ticker updates from exchanges"""
         if ticker.symbol not in self.active_symbols:
-            return
-        
-        # Find exchange name from the ticker data
-        exchange_name = None
-        for name, data in self.exchange_data.items():
-            if ticker.symbol in data and data[ticker.symbol].ticker.timestamp < ticker.timestamp:
-                exchange_name = name
-                break
-        
-        if not exchange_name:
-            # Try to identify exchange from available exchanges
-            for name in self.config.get_enabled_exchanges():
-                if name not in self.exchange_data:
-                    exchange_name = name
-                    break
-        
-        if not exchange_name:
             return
         
         # Update exchange data
@@ -175,6 +213,9 @@ class ArbitrageStrategy:
                     exchanges_with_data.append(data)
         
         if len(exchanges_with_data) < 2:
+            # Debug log to see what data we have
+            if len(exchanges_with_data) == 1:
+                logger.debug(f"Only 1 exchange data for {symbol}: {exchanges_with_data[0].exchange_name}")
             return
         
         # Find arbitrage opportunities
@@ -186,8 +227,8 @@ class ArbitrageStrategy:
                 exchange2 = exchanges_with_data[j]
                 
                 # Check both directions
-                opp1 = self._calculate_arbitrage(exchange1, exchange2, symbol)
-                opp2 = self._calculate_arbitrage(exchange2, exchange1, symbol)
+                opp1 = await self._calculate_arbitrage(exchange1, exchange2, symbol)
+                opp2 = await self._calculate_arbitrage(exchange2, exchange1, symbol)
                 
                 if opp1:
                     opportunities.append(opp1)
@@ -195,11 +236,18 @@ class ArbitrageStrategy:
                     opportunities.append(opp2)
         
         # Process opportunities
+        if opportunities:
+            logger.debug(f"Found {len(opportunities)} arbitrage opportunities for {symbol}")
+            
         for opportunity in opportunities:
-            if opportunity.profit_percent >= self.config.arbitrage.min_profit_threshold:
+            # Check if opportunity meets minimum profit threshold and doesn't exceed max spread threshold (abnormal filter)
+            if (opportunity.profit_percent >= self.config.arbitrage.min_profit_threshold and 
+                opportunity.profit_percent <= self.config.arbitrage.max_spread_threshold):
                 await self._handle_arbitrage_opportunity(opportunity)
+            elif opportunity.profit_percent > self.config.arbitrage.max_spread_threshold:
+                logger.warning(f"Abnormal spread detected for {opportunity.symbol}: {opportunity.profit_percent*100:.2f}% > {self.config.arbitrage.max_spread_threshold*100:.1f}% - filtering out")
     
-    def _calculate_arbitrage(self, buy_exchange: ExchangeData, sell_exchange: ExchangeData, 
+    async def _calculate_arbitrage(self, buy_exchange: ExchangeData, sell_exchange: ExchangeData, 
                            symbol: str) -> Optional[ArbitrageSignal]:
         """Calculate arbitrage opportunity between two exchanges"""
         
@@ -211,9 +259,16 @@ class ArbitrageStrategy:
         buy_size = buy_exchange.ticker.ask_size
         sell_size = sell_exchange.ticker.bid_size
         
-        # Calculate fees
-        buy_fee = buy_exchange.fees.get('taker', 0.001)  # Assume taker fee for market orders
-        sell_fee = sell_exchange.fees.get('taker', 0.001)
+        # Get trading fees dynamically (with caching)
+        try:
+            buy_fees = await self.get_trading_fees(buy_exchange.exchange_name, symbol)
+            sell_fees = await self.get_trading_fees(sell_exchange.exchange_name, symbol)
+            buy_fee = buy_fees.get('taker', 0.001)  # Assume taker fee for market orders
+            sell_fee = sell_fees.get('taker', 0.001)
+        except Exception as e:
+            logger.warning(f"Error getting fees for arbitrage calculation: {e}, using defaults")
+            buy_fee = 0.001
+            sell_fee = 0.001
         
         # Calculate profit accounting for fees
         gross_profit = sell_price - buy_price
