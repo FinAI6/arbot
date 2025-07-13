@@ -188,3 +188,4 @@ historical_data/
 # local files
 config.local.json
 .claude/settings.local.json
+*-journal
