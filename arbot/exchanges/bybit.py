@@ -139,15 +139,17 @@ class BybitExchange(BaseExchange):
         
         # Bybit has stricter limits on WebSocket subscriptions
         # Reduce to ticker only to avoid rate limits and improve stability
-        max_symbols_per_connection = 50   # Reduce dramatically to avoid system overload
+        max_symbols_per_connection = 100   # Maximum for single batch subscription
         
         if len(symbols) > max_symbols_per_connection:
             print(f"⚠️ Bybit 심볼 수 제한: {len(symbols)} → {max_symbols_per_connection}")
             symbols = symbols[:max_symbols_per_connection]
             self.symbols = symbols
         
-        self._expected_subscriptions = len(symbols)  # Only ticker subscriptions
+        # Calculate expected subscription confirmations (one per batch of 10)
+        self._expected_subscriptions = (len(symbols) + 9) // 10  # Ceiling division for batches
         self._subscription_count = 0
+        self._is_subscribing = False  # Flag to prevent duplicate subscriptions
         
         try:
             self.ws_connection = await websockets.connect(
@@ -158,23 +160,53 @@ class BybitExchange(BaseExchange):
             )
             self.connected = True
             
-            # Subscribe to tickers only (remove orderbook to reduce load)
-            for symbol in symbols:
-                await self._subscribe_ticker(symbol)
-                # Skip orderbook subscription to reduce connection load
-                # await self._subscribe_orderbook(symbol)
+            # Subscribe to all tickers in one batch (much more efficient)
+            print(f"🔄 Bybit: Initiating connection and subscription for {len(symbols)} symbols")
+            await self._subscribe_tickers_batch(symbols)
             
             self._ws_task = asyncio.create_task(self._handle_ws_messages())
         except Exception as e:
             print(f"Failed to connect to Bybit WebSocket: {e}")
             self.connected = False
     
+    async def _subscribe_tickers_batch(self, symbols: List[str]) -> None:
+        """Subscribe to multiple tickers in batches (max 10 per batch due to Bybit limits)"""
+        # Prevent duplicate subscriptions
+        if self._is_subscribing:
+            print("⚠️ Bybit: Already subscribing, skipping duplicate request")
+            return
+        
+        self._is_subscribing = True
+        print(f"🔄 Bybit: Starting batch subscription for {len(symbols)} symbols")
+        
+        try:
+            # Bybit has args size limit of 10 per subscription request
+            max_batch_size = 10
+            
+            for i in range(0, len(symbols), max_batch_size):
+                batch_symbols = symbols[i:i + max_batch_size]
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "args": [f"tickers.{symbol}" for symbol in batch_symbols]
+                }
+                await self.ws_connection.send(json.dumps(subscribe_msg))
+                print(f"✅ Bybit batch 구독: {len(batch_symbols)}개 심볼 (batch {i//max_batch_size + 1})")
+                
+                # Rate limit: Bybit allows 30 req/sec, so wait ~0.05s between requests
+                await asyncio.sleep(0.1)  # Ensure we don't exceed 20 req/sec (conservative)
+        finally:
+            self._is_subscribing = False
+            print(f"✅ Bybit: Batch subscription completed for {len(symbols)} symbols")
+    
     async def _subscribe_ticker(self, symbol: str) -> None:
+        """Individual ticker subscription (used for reconnection)"""
         subscribe_msg = {
             "op": "subscribe",
             "args": [f"tickers.{symbol}"]
         }
         await self.ws_connection.send(json.dumps(subscribe_msg))
+        # Rate limit: wait between individual subscription requests
+        await asyncio.sleep(0.1)
     
     async def _subscribe_orderbook(self, symbol: str) -> None:
         subscribe_msg = {
@@ -182,6 +214,8 @@ class BybitExchange(BaseExchange):
             "args": [f"orderbook.1.{symbol}"]
         }
         await self.ws_connection.send(json.dumps(subscribe_msg))
+        # Rate limit: wait between subscription requests
+        await asyncio.sleep(0.1)
     
     async def disconnect_ws(self) -> None:
         if self._ws_task:
@@ -199,10 +233,10 @@ class BybitExchange(BaseExchange):
     
     async def _handle_ws_messages(self) -> None:
         """Handle WebSocket messages with automatic reconnection"""
-        max_retries = 5  # Reduce retry attempts to avoid rate limits
+        max_retries = 3  # Further reduce retry attempts
         retry_count = 0
-        base_delay = 5   # Start with longer delay for rate limit recovery
-        max_delay = 120  # Longer max delay
+        base_delay = 10  # Start with even longer delay
+        max_delay = 300  # Much longer max delay (5 minutes)
         
         while self.connected or retry_count == 0:
             try:
@@ -216,11 +250,11 @@ class BybitExchange(BaseExchange):
                         close_timeout=10   # 표준화된 종료 타임아웃
                     )
                     
-                    # Re-subscribe to all symbols (ticker only)
+                    # Re-subscribe to all symbols using batch subscription
                     self._subscription_count = 0
-                    for symbol in self.symbols:
-                        await self._subscribe_ticker(symbol)
-                        # Skip orderbook subscription to reduce connection load
+                    self._is_subscribing = False  # Reset subscribing flag for reconnection
+                    print(f"🔄 Bybit: Re-subscribing to {len(self.symbols)} symbols after reconnection")
+                    await self._subscribe_tickers_batch(self.symbols)
                     
                     print(f"✅ Bybit WebSocket 재연결 성공 (시도 {retry_count})")
                 
@@ -297,8 +331,9 @@ class BybitExchange(BaseExchange):
                 # Check for rate limit related closures
                 if "1011" in str(e) or "keepalive ping timeout" in str(e):
                     print(f"⚠️ Bybit WebSocket rate limit detected: {e}")
-                    # Add extra delay for rate limit recovery
-                    await asyncio.sleep(30)
+                    # Add much longer delay for rate limit recovery
+                    print("⏳ Rate limit 복구를 위해 60초 대기...")
+                    await asyncio.sleep(60)
                 else:
                     print(f"⚠️ Bybit WebSocket connection closed: {e}")
                 

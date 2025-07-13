@@ -99,7 +99,7 @@ class BinanceExchange(BaseExchange):
         
         # Binance has a limit on streams per connection (200 streams max)
         # Now that message format is fixed, restore to full capacity
-        max_symbols_per_connection = 80   # Reduce dramatically to avoid system overload
+        max_symbols_per_connection = 150   # Match Bybit for consistency
         
         if len(symbols) > max_symbols_per_connection:
             logger.warning(f"Binance WebSocket: Too many symbols ({len(symbols)}), limiting to {max_symbols_per_connection}")
@@ -178,10 +178,10 @@ class BinanceExchange(BaseExchange):
     
     async def _handle_ws_messages_with_reconnect(self) -> None:
         """Handle WebSocket messages with automatic reconnection"""
-        max_retries = 10
+        max_retries = 3   # Further reduce retry attempts
         retry_count = 0
-        base_delay = 1
-        max_delay = 60
+        base_delay = 10   # Start with longer delay
+        max_delay = 300   # Much longer max delay (5 minutes)
         
         while self.connected or retry_count == 0:
             try:

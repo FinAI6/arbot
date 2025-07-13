@@ -661,8 +661,13 @@ class ArBot:
             symbols_to_monitor = self.dynamic_symbols[:max_symbols]  # Limit to configured max for comprehensive monitoring
             print(f"📡 모니터링 심볼: {len(symbols_to_monitor)}개")
             
-            for exchange_name, exchange in self.exchanges.items():
+            for i, (exchange_name, exchange) in enumerate(self.exchanges.items()):
                 try:
+                    # Add delay between exchange connections to reduce system load
+                    if i > 0:
+                        print(f"⏳ {exchange_name.upper()} 연결 대기 중 (3초)...")
+                        await asyncio.sleep(3)
+                    
                     await exchange.connect_ws(symbols_to_monitor)
                     print(f"✅ {exchange_name.upper()} WebSocket 연결 완료")
                 except Exception as e:
