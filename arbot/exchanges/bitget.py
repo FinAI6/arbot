@@ -93,15 +93,34 @@ class BitgetExchange(BaseExchange):
     async def connect_ws(self, symbols: List[str]) -> None:
         self.symbols = symbols
         
+        # Validate symbols against Bitget's available symbols first
+        try:
+            print(f"🔍 Bitget: Validating {len(symbols)} symbols...")
+            valid_symbols = await self._validate_symbols(symbols)
+            print(f"✅ Bitget: {len(valid_symbols)} valid symbols out of {len(symbols)}")
+            symbols = valid_symbols
+        except Exception as e:
+            logger.warning(f"Failed to validate Bitget symbols: {e}, using original list")
+        
+        # Limit symbols for Bitget to avoid overwhelming the connection
+        max_symbols_per_connection = 50  # Reduced limit for batch subscription
+        
+        if len(symbols) > max_symbols_per_connection:
+            logger.warning(f"Bitget WebSocket: Too many symbols ({len(symbols)}), limiting to {max_symbols_per_connection}")
+            print(f"⚠️ Bitget 심볼 수 제한: {len(symbols)} → {max_symbols_per_connection}")
+            symbols = symbols[:max_symbols_per_connection]
+            self.symbols = symbols
+        
         try:
             self.ws_connection = await websockets.connect(self.ws_url)
             self.connected = True
             
-            # Subscribe to tickers and orderbooks
-            for symbol in symbols:
-                await self._subscribe_ticker(symbol)
-                await self._subscribe_orderbook(symbol)
+            # Subscribe using batch subscription to avoid rate limits
+            print(f"🔄 Bitget: Batch subscribing to {len(symbols)} symbols...")
             
+            await self._subscribe_batch(symbols)
+            
+            print(f"✅ Bitget 구독 완료: {len(symbols)}개 심볼")
             self._ws_task = asyncio.create_task(self._handle_ws_messages())
         except Exception as e:
             print(f"Failed to connect to Bitget WebSocket: {e}")
@@ -110,26 +129,84 @@ class BitgetExchange(BaseExchange):
     async def _subscribe_ticker(self, symbol: str) -> None:
         subscribe_msg = {
             "op": "subscribe",
-            "args": [
-                {
-                    "instType": "sp",
-                    "channel": "ticker",
-                    "instId": symbol
-                }
-            ]
+            "args": [f"ticker:{symbol}"]
         }
         await self.ws_connection.send(json.dumps(subscribe_msg))
+    
+    async def _validate_symbols(self, symbols: List[str]) -> List[str]:
+        """Validate symbols against Bitget's available symbols using REST API"""
+        try:
+            # Get all available symbols from Bitget
+            available_symbols = await self.get_symbols()
+            available_set = set(available_symbols)
+            
+            # Filter input symbols to only those available on Bitget
+            valid_symbols = [symbol for symbol in symbols if symbol in available_set]
+            
+            invalid_count = len(symbols) - len(valid_symbols)
+            if invalid_count > 0:
+                logger.info(f"Bitget: Filtered out {invalid_count} invalid symbols")
+            
+            return valid_symbols
+        except Exception as e:
+            logger.error(f"Failed to validate Bitget symbols: {e}")
+            return symbols  # Return original list if validation fails
+    
+    def _convert_to_bitget_symbol(self, symbol: str) -> str:
+        """Convert standard symbol format to Bitget format"""
+        # Bitget might use different formats for WebSocket vs REST
+        # For now, return as is, but this can be extended if needed
+        return symbol
+    
+    async def _subscribe_batch(self, symbols: List[str]) -> None:
+        """Subscribe to multiple symbols in batches to avoid rate limits"""
+        # Bitget supports batch subscription with multiple channels
+        # Split into smaller batches to avoid request size limits
+        batch_size = 10  # Conservative batch size
+        
+        for i in range(0, len(symbols), batch_size):
+            batch_symbols = symbols[i:i + batch_size]
+            
+            # Create batch subscription for both ticker and orderbook
+            # According to Bitget API docs, the format should be channel:symbol
+            args = []
+            for symbol in batch_symbols:
+                # Convert symbol to Bitget format if needed
+                bitget_symbol = self._convert_to_bitget_symbol(symbol)
+                
+                # Add ticker channel - format: "ticker:SYMBOL"
+                args.append(f"ticker:{bitget_symbol}")
+                # Add orderbook channel - format: "books5:SYMBOL"
+                args.append(f"books5:{bitget_symbol}")
+            
+            subscribe_msg = {
+                "op": "subscribe",
+                "args": args
+            }
+            
+            try:
+                await self.ws_connection.send(json.dumps(subscribe_msg))
+                logger.info(f"Bitget: Sent batch subscription for {len(batch_symbols)} symbols")
+                
+                # Add delay between batches to prevent rate limiting
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Failed to send batch subscription: {e}")
+                # Fallback to individual subscriptions for this batch
+                for symbol in batch_symbols:
+                    try:
+                        bitget_symbol = self._convert_to_bitget_symbol(symbol)
+                        await self._subscribe_ticker(bitget_symbol)
+                        await self._subscribe_orderbook(bitget_symbol)
+                        await asyncio.sleep(0.1)
+                    except Exception as sub_e:
+                        logger.warning(f"Failed to subscribe to {symbol}: {sub_e}")
     
     async def _subscribe_orderbook(self, symbol: str) -> None:
         subscribe_msg = {
             "op": "subscribe",
-            "args": [
-                {
-                    "instType": "sp",
-                    "channel": "books5",
-                    "instId": symbol
-                }
-            ]
+            "args": [f"books5:{symbol}"]
         }
         await self.ws_connection.send(json.dumps(subscribe_msg))
     
@@ -165,12 +242,37 @@ class BitgetExchange(BaseExchange):
                     elif 'event' in data:
                         if data['event'] == 'subscribe':
                             # Extract readable info from subscription response
-                            arg = data.get('arg', {})
-                            channel = arg.get('channel', 'unknown')
-                            inst_id = arg.get('instId', 'unknown')
-                            print(f"✅ Bitget {channel} 구독: {inst_id}")
+                            arg = data.get('arg', 'unknown')
+                            if isinstance(arg, str) and ':' in arg:
+                                channel, inst_id = arg.split(':', 1)
+                                print(f"✅ Bitget {channel} 구독: {inst_id}")
+                            else:
+                                print(f"✅ Bitget 구독: {arg}")
                         elif data['event'] == 'error':
-                            print(f"❌ Bitget 오류: {data.get('msg', 'unknown error')}")
+                            # More detailed error handling
+                            error_msg = data.get('msg', 'Unknown error')
+                            error_code = data.get('code', 'Unknown code')
+                            arg = data.get('arg', {})
+                            
+                            # Check if it's a symbol existence error
+                            if "doesn't exist" in error_msg:
+                                # arg is now a string in format "channel:symbol"
+                                arg = data.get('arg', 'unknown')
+                                if isinstance(arg, str) and ':' in arg:
+                                    channel, inst_id = arg.split(':', 1)
+                                    logger.warning(f"Bitget symbol not found: {inst_id} (channel: {channel})")
+                                else:
+                                    logger.warning(f"Bitget symbol not found: {arg}")
+                                # Don't print these errors to console to reduce noise
+                            elif error_code == '30016':  # param error
+                                print(f"⚠️ Bitget param error: {error_msg}")
+                                logger.warning(f"Bitget parameter error: {error_msg}")
+                                # Log the problematic subscription for debugging
+                                arg = data.get('arg', 'unknown')
+                                if arg:
+                                    logger.warning(f"Problematic subscription: {arg}")
+                            else:
+                                print(f"❌ Bitget 오류 ({error_code}): {error_msg}")
                     else:
                         # Silently ignore other messages
                         pass
@@ -347,9 +449,24 @@ class BitgetExchange(BaseExchange):
         }
     
     async def get_symbols(self) -> List[str]:
-        data = await self._make_request('GET', '/api/spot/v1/public/products')
-        return [symbol_info['symbol'] for symbol_info in data['data'] 
-                if symbol_info['status'] == 'online']
+        try:
+            data = await self._make_request('GET', '/api/spot/v1/public/products')
+            symbols = []
+            for symbol_info in data['data']:
+                if symbol_info['status'] == 'online':
+                    symbol = symbol_info['symbol']
+                    # Bitget uses different symbol format (e.g., BTCUSDT_SPBL)
+                    # Convert to standard format
+                    if '_SPBL' in symbol:
+                        symbol = symbol.replace('_SPBL', '')
+                    symbols.append(symbol)
+            
+            logger.info(f"Bitget: Found {len(symbols)} online symbols")
+            return symbols
+            
+        except Exception as e:
+            logger.error(f"Failed to get Bitget symbols: {e}")
+            return []
     
     async def get_all_tickers(self) -> List[Dict]:
         """Get all ticker statistics"""

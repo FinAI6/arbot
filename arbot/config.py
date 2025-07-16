@@ -45,7 +45,7 @@ class ArbitrageConfig:
     max_position_size: float = 1000.0  # USD
     max_trades_per_hour: int = 50
     trade_amount_usd: float = 100.0
-    symbols: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
+    symbols: List[str] = field(default_factory=list)
     max_symbols: int = 200  # Maximum number of symbols to monitor
     slippage_tolerance: float = 0.001  # 0.1%
     max_spread_age_seconds: float = 5.0
@@ -215,7 +215,7 @@ class Config:
                 max_position_size=arb_data.get('max_position_size', 1000.0),
                 max_trades_per_hour=arb_data.get('max_trades_per_hour', 50),
                 trade_amount_usd=arb_data.get('trade_amount_usd', 100.0),
-                symbols=arb_data.get('symbols', ["BTCUSDT", "ETHUSDT"]),
+                symbols=arb_data.get('symbols', []),
                 max_symbols=arb_data.get('max_symbols', 200),
                 slippage_tolerance=arb_data.get('slippage_tolerance', 0.001),
                 max_spread_age_seconds=arb_data.get('max_spread_age_seconds', 5.0),
@@ -276,7 +276,7 @@ class Config:
     def _load_from_env(self) -> None:
         """Load sensitive configuration from environment variables"""
         # Exchange API keys from environment
-        for exchange_name in ['binance', 'bybit', 'okx', 'bitget']:
+        for exchange_name in ['binance', 'bybit', 'okx', 'bitget', 'upbit']:
             api_key = os.getenv(f"{exchange_name.upper()}_API_KEY")
             api_secret = os.getenv(f"{exchange_name.upper()}_API_SECRET")
             testnet = os.getenv(f"{exchange_name.upper()}_TESTNET", "false").lower() == "true"
@@ -413,8 +413,7 @@ class Config:
                 if not exchange.api_secret:
                     errors.append(f"API secret missing for {name}")
         
-        if not self.arbitrage.symbols:
-            errors.append("No trading symbols configured")
+        # Symbols will be dynamically detected from exchanges, so no need to validate here
         
         if self.arbitrage.min_profit_threshold <= 0:
             errors.append("Minimum profit threshold must be positive")

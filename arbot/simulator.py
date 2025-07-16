@@ -241,6 +241,14 @@ class TradingSimulator:
                 quote_asset = 'USDT' if 'USDT' in trade.signal.symbol else 'USDC'
                 required_amount = trade.buy_order.quantity * trade.buy_order.price
                 
+                if quote_asset not in self.balances[trade.signal.buy_exchange]:
+                    # Initialize balance if it doesn't exist
+                    self.balances[trade.signal.buy_exchange][quote_asset] = SimulatedBalance(
+                        asset=quote_asset,
+                        free=10000.0,  # Default USDT balance
+                        locked=0.0
+                    )
+                
                 exchange_balance = self.balances[trade.signal.buy_exchange][quote_asset]
                 if exchange_balance.free < required_amount:
                     return False
@@ -252,6 +260,14 @@ class TradingSimulator:
             if trade.sell_order:
                 base_asset = trade.signal.symbol.replace('USDT', '').replace('USDC', '')
                 required_amount = trade.sell_order.quantity
+                
+                if base_asset not in self.balances[trade.signal.sell_exchange]:
+                    # Initialize balance if it doesn't exist
+                    self.balances[trade.signal.sell_exchange][base_asset] = SimulatedBalance(
+                        asset=base_asset,
+                        free=1000.0,  # Default balance
+                        locked=0.0
+                    )
                 
                 exchange_balance = self.balances[trade.signal.sell_exchange][base_asset]
                 if exchange_balance.free < required_amount:

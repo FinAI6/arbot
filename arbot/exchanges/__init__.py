@@ -3,6 +3,7 @@ from .binance import BinanceExchange
 from .bybit import BybitExchange
 from .okx import OKXExchange
 from .bitget import BitgetExchange
+from .upbit import UpbitExchange
 
 __all__ = [
     'BaseExchange',
@@ -17,4 +18,5 @@ __all__ = [
     'BybitExchange',
     'OKXExchange',
     'BitgetExchange',
+    'UpbitExchange',
 ]

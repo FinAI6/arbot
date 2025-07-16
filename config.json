@@ -9,25 +9,6 @@
     "max_spread_age_seconds": 5.0,
     "use_dynamic_symbols": true,
     "max_spread_threshold": 2.0,
-    "symbols": [
-      "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "AVAXUSDT", 
-      "DOGEUSDT", "MATICUSDT", "LINKUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT",
-      "DOTUSDT", "BCHUSDT", "ETCUSDT", "FILUSDT", "TRXUSDT", "XLMUSDT",
-      "VETUSDT", "ICPUSDT", "FTMUSDT", "THETAUSDT", "HBARUSDT", "EOSUSDT",
-      "AAVEUSDT", "MKRUSDT", "SUSHIUSDT", "COMPUSDT", "YFIUSDT", "SNXUSDT",
-      "CRVUSDT", "1INCHUSDT", "ENJUSDT", "CHZUSDT", "MANAUSDT", "SANDUSDT",
-      "GALAUSDT", "LRCUSDT", "BATUSDT", "ZRXUSDT", "STORJUSDT", "KNCUSDT",
-      "RENUSDT", "BALUSDT", "BANDUSDT", "ANKRUSDT", "CELOUSDT", "CTKUSDT",
-      "ORNUSDT", "NMRUSDT", "RSRUSDT", "RLCUSDT", "ALGOUSDT", "ZILUSDT",
-      "OGNUSDT", "REQUSDT", "CTSIUSDT", "IOTAUSDT", "ONEUSDT", "ONTUSDT",
-      "ZECUSDT", "WAVESUSDT", "ZENUSDT", "RVNUSDT", "DCRUSDT", "QTUMUSDT",
-      "IOSTUSDT", "CELRUSDT", "TOMOUSDT", "PERLUSDT", "DUSKUSDT", "RSRRUSDT",
-      "KSMUSDT", "DGBUSDT", "ARDRUSDT", "NKNUSDT", "SCUSDT", "STMXUSDT",
-      "KMDUSDT", "BNBUSDT", "NEOUSDT", "DASHUSDT", "XMRUSDT", "XTZUSDT",
-      "EGLRUSDT", "SFPUSDT", "ARPAUSDT", "CTXCUSDT", "BELUSDT", "WINGUSDT",
-      "CREAMUSDT", "BALUSDT", "FISUSDT", "KEYUSDT", "HARDUSDT", "CKBUSDT",
-      "PONDUSDT", "DEFIUSDT", "WANUSDT", "VTHOUSDT"
-    ],
     "enabled_quote_currencies": ["USDT"],
     "available_quote_currencies": ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"],
     "moving_average_periods": 30,
@@ -87,6 +68,15 @@
       "premium_baseline": 0.0,
       "maker_fee": 0.0008,
       "taker_fee": 0.001
+    },
+    "upbit": {
+      "enabled": false,
+      "arbitrage_enabled": false,
+      "testnet": false,
+      "region": "korea",
+      "premium_baseline": 2.5,
+      "maker_fee": 0.0005,
+      "taker_fee": 0.0005
     }
   },
   "risk_management": {

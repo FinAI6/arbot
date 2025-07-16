@@ -21,7 +21,7 @@ from .trader import LiveTrader
 from .simulator import TradingSimulator
 from .backtester import Backtester
 from .gui import run_gui
-from .exchanges import BinanceExchange, BybitExchange, BitgetExchange, OKXExchange
+from .exchanges import BinanceExchange, BybitExchange, BitgetExchange, OKXExchange, UpbitExchange
 
 # Configure logging
 logging.basicConfig(
@@ -155,6 +155,16 @@ class ArBot:
                 'ask': safe_float(ticker_data.get('sellOne')) or None,  # Bitget uses sellOne for ask
                 'last_price': safe_float(ticker_data.get('close')) or safe_float(ticker_data.get('lastPrice')),
                 'volume': safe_float(ticker_data.get('baseVol')),  # Bitget uses baseVol
+                'timestamp': time.time()
+            }
+        elif exchange_name.lower() == 'upbit':
+            # Upbit ticker format
+            normalized = {
+                'symbol': ticker_data.get('market'),  # Upbit uses market for symbol
+                'bid': safe_float(ticker_data.get('trade_price')) * 0.9999 if ticker_data.get('trade_price') else None,
+                'ask': safe_float(ticker_data.get('trade_price')) * 1.0001 if ticker_data.get('trade_price') else None,
+                'last_price': safe_float(ticker_data.get('trade_price')),
+                'volume': safe_float(ticker_data.get('acc_trade_volume_24h')),
                 'timestamp': time.time()
             }
         else:
@@ -477,6 +487,12 @@ class ArBot:
                         api_secret,
                         exchange_config.testnet
                     )
+                elif exchange_name == 'upbit':
+                    exchange = UpbitExchange(
+                        api_key,
+                        api_secret,
+                        exchange_config.testnet
+                    )
                 else:
                     logger.warning(f"⚠️ 알 수 없는 거래소: {exchange_name}")
                     continue
@@ -506,6 +522,24 @@ class ArBot:
                 'TWTUSDT', 'STRAXUSDT', 'FISUSDT', 'OXTUSDT', 'MDTUSDT'
             }
             return [s for s in symbols if s not in problematic_symbols]
+        elif exchange_name.lower() == 'bitget':
+            # Bitget has issues with certain symbol formats
+            problematic_symbols = {
+                # Symbols with numeric prefixes that don't exist on Bitget
+                '1000CATUSDT', '1000CHEEMSUSDT', '1000SATSUSDT', '1MBABYDOGEUSDT',
+                '1000BONKUSDT', '1000PEPEUSDT', '1000FLOKIUSDT', '1000LUNCUSDT',
+                '1000XECUSDT', '1000RATSUSDT', '1000BTTCUSDT', '1000XUSDT',
+                # Other problematic symbols
+                'STORJUSDT', 'KNCUSDT', 'BANDUSDT', 'CTKUSDT', 'RSRUSDT',
+                'RLCUSDT', 'BNTUSDT', 'DREPUSDT', 'WNXMUSDT', 'TWTUSDT',
+                'STRAXUSDT', 'FISUSDT', 'OXTUSDT', 'MDTUSDT'
+            }
+            # Also filter out symbols that start with numbers
+            filtered_symbols = []
+            for symbol in symbols:
+                if symbol not in problematic_symbols and not symbol[0].isdigit():
+                    filtered_symbols.append(symbol)
+            return filtered_symbols
         elif exchange_name.lower() == 'binance':
             # Filter symbols that might have low liquidity or trading issues
             return symbols  # Binance generally has good symbol support
@@ -528,6 +562,13 @@ class ArBot:
                 'MLNUSDT', 'DEXEUSDT', 'STORJUSDT', 'KNCUSDT', 'BANDUSDT'
             }]
             return safe_symbols
+        elif exchange_name.lower() == 'bitget':
+            # Remove symbols known to be problematic on Bitget
+            safe_symbols = [s for s in common_symbols if not s[0].isdigit() and s not in {
+                'STORJUSDT', 'KNCUSDT', 'BANDUSDT', 'CTKUSDT', 'RSRUSDT',
+                'RLCUSDT', 'BNTUSDT', 'DREPUSDT', 'WNXMUSDT', 'TWTUSDT'
+            }]
+            return safe_symbols
         else:
             return common_symbols
     
@@ -535,7 +576,7 @@ class ArBot:
         """Dynamically detect common symbols across exchanges"""
         if len(self.exchanges) < 1:
             logger.warning("Need at least 1 exchange for symbol detection")
-            return ["BTCUSDT", "ETHUSDT"]  # Fallback to basic symbols
+            return []  # Return empty list if no exchanges
         
         logger.info(f"Detecting symbols from {len(self.exchanges)} exchanges: {list(self.exchanges.keys())}")
         
@@ -552,8 +593,10 @@ class ArBot:
                     if symbols:
                         # Filter for USDT pairs only
                         usdt_symbols = [s for s in symbols if s.endswith('USDT')]
-                        exchange_symbols[exchange_name] = set(usdt_symbols)
-                        logger.info(f"{exchange_name}: Found {len(usdt_symbols)} USDT pairs")
+                        # Remove known problematic symbols for specific exchanges
+                        filtered_symbols = self._filter_symbols_for_exchange(usdt_symbols, exchange_name)
+                        exchange_symbols[exchange_name] = set(filtered_symbols)
+                        logger.info(f"{exchange_name}: Found {len(filtered_symbols)} valid USDT pairs (filtered from {len(usdt_symbols)})")
                     else:
                         logger.warning(f"{exchange_name}: get_symbols returned empty")
                 else:
@@ -566,7 +609,7 @@ class ArBot:
                         # Remove known problematic symbols for specific exchanges
                         filtered_symbols = self._filter_symbols_for_exchange(usdt_symbols, exchange_name)
                         exchange_symbols[exchange_name] = set(filtered_symbols)
-                        logger.info(f"{exchange_name}: Found {len(filtered_symbols)} valid USDT pairs")
+                        logger.info(f"{exchange_name}: Found {len(filtered_symbols)} valid USDT pairs (filtered from {len(usdt_symbols)})")
                     else:
                         logger.warning(f"{exchange_name}: get_all_tickers returned empty")
                         
@@ -579,7 +622,7 @@ class ArBot:
         
         if not exchange_symbols:
             logger.error("Failed to get symbols from any exchange")
-            return ["BTCUSDT", "ETHUSDT"]
+            return []
         
         # Determine symbols based on number of exchanges
         if len(self.exchanges) == 1:
@@ -616,11 +659,26 @@ class ArBot:
             # Sort common symbols alphabetically for consistency
             sorted_symbols = sorted(list(common_symbols))
             
-            # Limit to max_symbols for performance
+            # Limit to max_symbols for performance, but also consider exchange-specific limits
             max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
-            final_symbols = sorted_symbols[:max_symbols]
             
-            logger.info(f"Found {len(sorted_symbols)} common symbols, using top {len(final_symbols)}")
+            # Apply exchange-specific limits
+            exchange_limits = {
+                'upbit': 100,  # Upbit WebSocket limit
+                'binance': 200,  # Binance can handle more
+                'bybit': 200,  # Bybit can handle more
+                'bitget': 200   # Bitget can handle more
+            }
+            
+            # Find the most restrictive limit among active exchanges
+            min_limit = max_symbols
+            for exchange_name in self.exchanges.keys():
+                if exchange_name.lower() in exchange_limits:
+                    min_limit = min(min_limit, exchange_limits[exchange_name.lower()])
+            
+            final_symbols = sorted_symbols[:min_limit]
+            
+            logger.info(f"Found {len(sorted_symbols)} common symbols, using top {len(final_symbols)} (limited by exchange constraints)")
             
             # Log some example symbols
             if final_symbols:
@@ -634,14 +692,14 @@ class ArBot:
         try:
             print("🚀 ArBot 거래 시작...")
             
-            # Always use dynamic symbols detection for better exchange compatibility
+            # Always use dynamic symbols detection - this is now the primary method
             print("🔍 거래소별 지원 심볼 자동 감지 중...")
             self.dynamic_symbols = await self.get_common_symbols_with_volume()
             
-            # Log comparison with config for reference
-            config_symbols = self.config.arbitrage.symbols if hasattr(self.config.arbitrage, 'symbols') else []
-            if config_symbols:
-                print(f"📋 설정 심볼 {len(config_symbols)}개 → 동적 감지 심볼 {len(self.dynamic_symbols)}개로 변경")
+            if not self.dynamic_symbols:
+                raise ValueError("동적 심볼 감지 실패: 사용 가능한 심볼이 없습니다")
+            
+            print(f"📋 감지된 심볼: {len(self.dynamic_symbols)}개")
             
             # Update strategy with dynamic symbols
             self.strategy.set_active_symbols(self.dynamic_symbols)
@@ -746,9 +804,9 @@ class ArBot:
         try:
             logger.info(f"Starting backtest from {start_date} to {end_date}")
             
-            # Use config symbols and exchanges if not specified
+            # Use dynamic symbols and exchanges if not specified
             if symbols is None:
-                symbols = self.config.arbitrage.symbols
+                symbols = self.dynamic_symbols if hasattr(self, 'dynamic_symbols') and self.dynamic_symbols else []
             if exchanges is None:
                 exchanges = self.config.get_enabled_exchanges()
             
@@ -779,7 +837,7 @@ class ArBot:
             'is_running': self.is_running,
             'trading_mode': self.config.trading_mode.value,
             'exchanges': list(self.exchanges.keys()),
-            'symbols': self.config.arbitrage.symbols
+            'symbols': self.dynamic_symbols if hasattr(self, 'dynamic_symbols') else []
         }
         
         # Add strategy stats
@@ -813,7 +871,6 @@ def create_sample_config():
             "min_profit_threshold": 0.001,
             "max_position_size": 1000.0,
             "trade_amount_usd": 100.0,
-            "symbols": ["BTCUSDT", "ETHUSDT"],
             "slippage_tolerance": 0.001,
             "max_spread_age_seconds": 5.0
         },
