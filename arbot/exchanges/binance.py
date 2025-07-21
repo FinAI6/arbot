@@ -24,8 +24,14 @@ class BinanceExchange(BaseExchange):
         self._server_time_offset = 0
     
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+        # Always create a fresh session to avoid event loop conflicts
+        if self.session and not self.session.closed:
+            try:
+                await self.session.close()
+            except:
+                pass
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
     
     def _generate_signature(self, query_string: str) -> str:

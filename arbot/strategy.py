@@ -162,6 +162,8 @@ class ArbitrageStrategy:
             # Debug log to see what data we have
             if len(exchanges_with_data) == 1:
                 logger.debug(f"Only 1 exchange data for {symbol}: {exchanges_with_data[0].exchange_name}")
+            elif len(exchanges_with_data) == 0:
+                logger.debug(f"No exchange data available for {symbol}")
             return
         
         # Find arbitrage opportunities
@@ -181,14 +183,19 @@ class ArbitrageStrategy:
                 if opp2:
                     opportunities.append(opp2)
         
-        # Process opportunities
-        if opportunities:
-            logger.debug(f"Found {len(opportunities)} arbitrage opportunities for {symbol}")
+        # Process opportunities (log only high-value opportunities to reduce spam)
+        high_value_opportunities = [opp for opp in opportunities if opp.profit_percent >= self.config.arbitrage.min_profit_threshold]
+        if high_value_opportunities:
+            logger.info(f"📈 Found {len(high_value_opportunities)} profitable arbitrage opportunities for {symbol}")
+            for opp in high_value_opportunities:
+                logger.info(f"📈 {symbol}: {opp.buy_exchange}->{opp.sell_exchange} "
+                           f"{opp.profit_percent*100:.3f}% profit")
             
         for opportunity in opportunities:
             # Check if opportunity meets minimum profit threshold and doesn't exceed max spread threshold (abnormal filter)
             if (opportunity.profit_percent >= self.config.arbitrage.min_profit_threshold and 
                 opportunity.profit_percent <= self.config.arbitrage.max_spread_threshold):
+                logger.info(f"✅ Opportunity meets criteria: {opportunity.profit_percent*100:.3f}% profit")
                 await self._handle_arbitrage_opportunity(opportunity)
             elif opportunity.profit_percent > self.config.arbitrage.max_spread_threshold:
                 logger.warning(f"Abnormal spread detected for {opportunity.symbol}: {opportunity.profit_percent*100:.2f}% > {self.config.arbitrage.max_spread_threshold*100:.1f}% - filtering out")

@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, scrolledtext
 import asyncio
 import threading
 import time
+import os
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import logging
@@ -423,7 +424,7 @@ class ArBotGUI:
         opp_frame = ttk.LabelFrame(right_panel, text="Arbitrage Opportunities", padding="5")
         opp_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
         
-        opp_columns = ('Symbol', 'Buy From', 'Sell To', 'Profit %', 'Amount')
+        opp_columns = ('Symbol', 'Buy From', 'Sell To', 'Buy Price', 'Amount')
         self.opp_tree = ttk.Treeview(opp_frame, columns=opp_columns, show='headings', height=8)
         
         for col in opp_columns:
@@ -510,7 +511,7 @@ class ArBotGUI:
         amount_entry.grid(row=0, column=4, padx=(0, 20))
         amount_entry.bind('<Return>', self.update_settings)
         
-        ttk.Label(controls_frame, text="Min Profit %:").grid(row=0, column=5, padx=(20, 5))
+        ttk.Label(controls_frame, text="Min Spread %:").grid(row=0, column=5, padx=(20, 5))
         self.min_profit_var = tk.StringVar(value=str(self.config.arbitrage.min_profit_threshold * 100))
         profit_entry = ttk.Entry(controls_frame, textvariable=self.min_profit_var, width=10)
         profit_entry.grid(row=0, column=6, padx=(0, 20))
@@ -939,7 +940,7 @@ class ArBotGUI:
         
         try:
             # Min profit threshold
-            ttk.Label(scrollable_frame, text="Min Profit Threshold (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
+            ttk.Label(scrollable_frame, text="Min Spread Threshold (%):").grid(row=row_cnt, column=0, sticky=tk.W, pady=5)
             profit_threshold = getattr(self.config.arbitrage, 'min_profit_threshold', 0.005) * 100
             profit_var = tk.StringVar(value=str(profit_threshold))
             ttk.Entry(scrollable_frame, textvariable=profit_var).grid(row=row_cnt, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
@@ -1526,7 +1527,10 @@ class ArBotGUI:
             # Update config object
             if 'trading_mode' in self.settings_vars:
                 mode_value = self.settings_vars['trading_mode'].get()
+                logger.info(f"🔧 Settings trading_mode from UI: {mode_value}")
+                logger.info(f"🔧 Current config mode before update: {self.config.trading_mode.value}")
                 self.config.trading_mode = TradingMode(mode_value)
+                logger.info(f"🔧 Config mode after update: {self.config.trading_mode.value}")
             
             if 'trade_amount_usd' in self.settings_vars:
                 self.config.arbitrage.trade_amount_usd = float(self.settings_vars['trade_amount_usd'].get())
@@ -1663,14 +1667,7 @@ class ArBotGUI:
                 csv_path = self.settings_vars['csv_path'].get()
                 self.config.backtest.csv_path = csv_path if csv_path else None
             
-            # Update exchange settings
-            for exchange_name, vars_dict in self.exchange_vars.items():
-                if exchange_name in self.config.exchanges:
-                    self.config.exchanges[exchange_name].enabled = vars_dict['enabled'].get()
-                    self.config.exchanges[exchange_name].api_key = vars_dict['api_key'].get()
-                    self.config.exchanges[exchange_name].api_secret = vars_dict['api_secret'].get()
-                    self.config.exchanges[exchange_name].testnet = vars_dict['testnet'].get()
-                    self.config.exchanges[exchange_name].arbitrage_enabled = vars_dict['arbitrage_enabled'].get()
+            # Note: API keys are now managed via environment variables, not saved to config files
             
             # Save to config.local.json
             config_data = {
@@ -1714,8 +1711,6 @@ class ArBotGUI:
                 'exchanges': {
                     exchange_name: {
                         'enabled': config.enabled,
-                        'api_key': config.api_key,
-                        'api_secret': config.api_secret,
                         'testnet': config.testnet,
                         'arbitrage_enabled': config.arbitrage_enabled
                     }
@@ -1731,27 +1726,72 @@ class ArBotGUI:
             
             logger.info("Settings saved to config.local.json")
             
+            # Update .env file with trading mode to prevent environment variable override
+            if 'trading_mode' in self.settings_vars:
+                mode_value = config_data['trading_mode']
+                logger.info(f"🔧 Updating .env with TRADING_MODE={mode_value}")
+                self._update_env_file('TRADING_MODE', mode_value)
+            
+            # Reload config from files to ensure consistency
+            logger.info(f"🔧 Config before reload: {self.config.trading_mode.value}")
+            self.config._load_config()
+            logger.info(f"🔧 Config after reload: {self.config.trading_mode.value}")
+            logger.info("Configuration reloaded from files")
+            
             # Update GUI variables
             self.amount_var.set(str(self.config.arbitrage.trade_amount_usd))
             self.min_profit_var.set(str(self.config.arbitrage.min_profit_threshold * 100))
             
             # Schedule UI updates and cleanup after reinitialization
-            def complete_settings_save():
+            async def complete_settings_save_async():
                 try:
                     # First reinitialize components
-                    self.run_async(self._reinitialize_components())
+                    await self._reinitialize_components()
                     # Then show success message and close window
-                    self.root.after(100, lambda: self._finish_settings_save(settings_window))
+                    self.root.after(0, lambda: self._finish_settings_save(settings_window))
                 except Exception as e:
                     logger.error(f"Error during settings completion: {e}")
                     self.root.after(0, lambda: messagebox.showerror("Error", f"Settings error: {e}"))
             
-            self.root.after(0, complete_settings_save)
+            # Schedule the async operation
+            asyncio.create_task(complete_settings_save_async())
             
         except Exception as e:
             logger.error(f"Error saving settings: {e}")
             # Ensure error messagebox is called from main thread
             self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to save settings: {e}"))
+    
+    def _update_env_file(self, key: str, value: str):
+        """Update a specific key in the .env file"""
+        try:
+            env_file_path = '.env'
+            
+            # Read current .env file
+            env_lines = []
+            if os.path.exists(env_file_path):
+                with open(env_file_path, 'r') as f:
+                    env_lines = f.readlines()
+            
+            # Update or add the key
+            key_found = False
+            for i, line in enumerate(env_lines):
+                if line.strip().startswith(f"{key}="):
+                    env_lines[i] = f"{key}={value}\n"
+                    key_found = True
+                    break
+            
+            # If key not found, add it
+            if not key_found:
+                env_lines.append(f"{key}={value}\n")
+            
+            # Write back to .env file
+            with open(env_file_path, 'w') as f:
+                f.writelines(env_lines)
+                
+            logger.info(f"Updated .env file: {key}={value}")
+            
+        except Exception as e:
+            logger.error(f"Error updating .env file: {e}")
     
     async def _reinitialize_components(self):
         """Reinitialize components after configuration changes"""
@@ -1911,14 +1951,25 @@ class ArBotGUI:
         """Update UI labels with current configuration"""
         try:
             # Update mode label
-            self.mode_label.config(text=f"Mode: {self.config.trading_mode.value}")
-            logger.info(f"Updated mode label to: {self.config.trading_mode.value}")
+            current_mode = self.config.trading_mode.value
+            logger.info(f"🔄 _update_ui_labels called - config mode: {current_mode}")
+            logger.info(f"🔄 mode_label exists: {hasattr(self, 'mode_label')}")
+            
+            if hasattr(self, 'mode_label'):
+                old_text = self.mode_label.cget('text')
+                new_text = f"Mode: {current_mode}"
+                self.mode_label.config(text=new_text)
+                logger.info(f"🔄 Mode label updated: '{old_text}' -> '{new_text}'")
+            else:
+                logger.warning("🔄 mode_label attribute not found!")
             
             # Reset balance update timing when mode changes to ensure fresh balance fetch
             self.last_balance_update = 0
             
         except Exception as e:
             logger.error(f"Error updating UI labels: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
     
     def _finish_settings_save(self, settings_window):
         """Complete the settings save process with UI feedback"""
@@ -2260,7 +2311,82 @@ class ArBotGUI:
                 logger.error(f"Error in UI update: {e}")
             finally:
                 self.root.after(self.config.ui.refresh_rate_ms, self.update_ui)  # Use configurable refresh rate
+                
+                # Check WebSocket connections every 30 seconds
+                if not hasattr(self, '_last_connection_check'):
+                    self._last_connection_check = time.time()
+                
+                if time.time() - self._last_connection_check > 30:
+                    self._check_websocket_connections()
+                    self._last_connection_check = time.time()
     
+    def _check_websocket_connections(self):
+        """Check WebSocket connections and attempt reconnection if needed"""
+        if not self.exchanges:
+            return
+            
+        current_time = time.time()
+        reconnection_needed = False
+        
+        for exchange_name, exchange in self.exchanges.items():
+            # Check if exchange has any recent data
+            if exchange_name in self.current_prices and self.current_prices[exchange_name]:
+                symbol_count = len(self.current_prices[exchange_name])
+                fresh_count = 0
+                
+                for sym_data in self.current_prices[exchange_name].values():
+                    data_age = current_time - sym_data.get('timestamp', 0)
+                    if data_age < 120:  # Data less than 2 minutes old
+                        fresh_count += 1
+                
+                freshness_ratio = fresh_count / symbol_count if symbol_count > 0 else 0
+                
+                # Only consider reconnection if we had data but it's now stale
+                if symbol_count > 10 and freshness_ratio < 0.1:  # Need at least 10 symbols to be meaningful
+                    logger.warning(f"⚠️ {exchange_name} WebSocket may be disconnected. Fresh data: {fresh_count}/{symbol_count} ({freshness_ratio:.1%})")
+                    reconnection_needed = True
+                
+                if not hasattr(self, '_connection_check_count'):
+                    self._connection_check_count = 0
+                self._connection_check_count += 1
+                
+                if self._connection_check_count % 10 == 1:  # Log occasionally
+                    logger.info(f"📡 {exchange_name} connection health: {fresh_count}/{symbol_count} fresh ({freshness_ratio:.1%})")
+            else:
+                # No data at all - this is expected during startup
+                if not hasattr(self, '_startup_grace_period'):
+                    self._startup_grace_period = current_time + 60  # 1 minute grace period
+                
+                if current_time > self._startup_grace_period:
+                    logger.warning(f"⚠️ {exchange_name} has no price data - may need reconnection")
+                    reconnection_needed = True
+        
+        if reconnection_needed:
+            logger.info("🔄 Attempting WebSocket reconnection...")
+            self.run_async(self._reconnect_websockets())
+    
+    async def _reconnect_websockets(self):
+        """Reconnect WebSocket connections"""
+        try:
+            if not self.dynamic_symbols:
+                logger.warning("No symbols available for reconnection")
+                return
+            
+            max_symbols = getattr(self.config.arbitrage, 'max_symbols', 200)
+            symbols_to_monitor = self.dynamic_symbols[:max_symbols]
+            
+            for exchange_name, exchange in self.exchanges.items():
+                try:
+                    logger.info(f"Reconnecting {exchange_name} WebSocket...")
+                    await exchange.disconnect_ws()
+                    await asyncio.sleep(1)  # Brief delay
+                    await exchange.connect_ws(symbols_to_monitor)
+                    logger.info(f"✅ {exchange_name} WebSocket reconnected")
+                except Exception as e:
+                    logger.error(f"❌ Failed to reconnect {exchange_name}: {e}")
+        except Exception as e:
+            logger.error(f"Error during WebSocket reconnection: {e}")
+
     async def _update_data(self):
         """Update data from components"""
         try:
@@ -2295,11 +2421,23 @@ class ArBotGUI:
             # Update trader/simulator stats and balances
             if self.trader and self.config.trading_mode == TradingMode.LIVE:
                 trader_stats = self.trader.get_stats()
-                self.current_balances = trader_stats.get('balances', {})
+                trader_balances = trader_stats.get('balances', {})
+                # Only use trader balances if they exist, otherwise keep real exchange balances
+                if trader_balances:
+                    self.current_balances = trader_balances
+                    logger.info(f"🏦 Using trader balances: {list(trader_balances.keys())}")
+                else:
+                    logger.info(f"🏦 Trader has no balances, keeping real exchange balances: {list(self.current_balances.keys()) if self.current_balances else 'None'}")
                 completed_trades = trader_stats.get('completed_trades', [])
             elif self.simulator:
                 sim_stats = self.simulator.get_stats()
-                self.current_balances = sim_stats.get('balances', {})
+                sim_balances = sim_stats.get('balances', {})
+                # Only use simulator balances if they exist, otherwise use simulated defaults
+                if sim_balances:
+                    self.current_balances = sim_balances
+                else:
+                    # Keep existing balances (could be real or simulated)
+                    pass
                 completed_trades = sim_stats.get('completed_trades', [])
                 
                 # Update profit display
@@ -2460,8 +2598,13 @@ class ArBotGUI:
                             
                             # Check data staleness (use more lenient threshold to keep display populated)
                             current_time = time.time()
-                            if (current_time - price1_data.get('timestamp', 0) > 60 or 
-                                current_time - price2_data.get('timestamp', 0) > 60):
+                            price1_age = current_time - price1_data.get('timestamp', 0)
+                            price2_age = current_time - price2_data.get('timestamp', 0)
+                            
+                            # Increased timeout from 60s to 180s to maintain display stability
+                            if price1_age > 180 or price2_age > 180:
+                                if self._price_display_debug_count % 50 == 1:  # Log occasionally
+                                    logger.debug(f"Skipping stale data for {symbol}: {exchange1} age={price1_age:.1f}s, {exchange2} age={price2_age:.1f}s")
                                 continue
                             
                             # Use mid price (average of bid/ask) for arbitrage calculation
@@ -2589,7 +2732,22 @@ class ArBotGUI:
                     if len(exchange_names) < 2:
                         logger.info(f"  Reason: Only {len(exchange_names)} exchange(s), need 2+ for arbitrage")
                     else:
+                        # More detailed debugging
+                        current_time = time.time()
                         logger.info(f"  Reason: No common symbols or data validation failed")
+                        for exch in exchange_names:
+                            symbol_count = len(self.current_prices[exch])
+                            if symbol_count > 0:
+                                # Check freshness of data
+                                fresh_count = 0
+                                sample_symbol = list(self.current_prices[exch].keys())[0]
+                                sample_age = current_time - self.current_prices[exch][sample_symbol].get('timestamp', 0)
+                                for sym_data in self.current_prices[exch].values():
+                                    if current_time - sym_data.get('timestamp', 0) < 180:
+                                        fresh_count += 1
+                                logger.info(f"    {exch}: {symbol_count} symbols, {fresh_count} fresh (<3min), sample age: {sample_age:.1f}s")
+                            else:
+                                logger.info(f"    {exch}: 0 symbols")
             
             # Only clear and update display if we have valid arbitrage data
             if arbitrage_rows:
@@ -2693,7 +2851,7 @@ class ArBotGUI:
                 opp.symbol,
                 opp.buy_exchange.upper(),
                 opp.sell_exchange.upper(),
-                f"{profit_pct:.3f}%",
+                f"${opp.buy_price:.6f}",
                 f"${opp.profit:.2f}"
             ), tags=(tag,))
         
@@ -2724,6 +2882,13 @@ class ArBotGUI:
         has_balance_data = bool(self.current_balances)
         balance_rows = []
         
+        # Debug logging
+        logger.info(f"🏦 update_balance_display called - has_balance_data: {has_balance_data}")
+        if self.current_balances:
+            logger.info(f"🏦 Current balances: {list(self.current_balances.keys())}")
+            for exch, balances in self.current_balances.items():
+                logger.info(f"🏦 {exch}: {len(balances) if balances else 0} assets")
+        
         if has_balance_data:
             # Process balance data first
             for exchange_name, balances in self.current_balances.items():
@@ -2751,9 +2916,13 @@ class ArBotGUI:
                             'locked': locked,
                             'total': total
                         })
+            
+            logger.info(f"🏦 Processed {len(balance_rows)} balance rows for display")
         
         # Only clear and update if we have data to show, or if the tree is currently empty
         current_items = self.balance_tree.get_children()
+        logger.info(f"🏦 Current tree items: {len(current_items)}, balance_rows: {len(balance_rows)}")
+        
         if balance_rows or not current_items:
             # Clear existing items
             for item in current_items:
@@ -2761,6 +2930,7 @@ class ArBotGUI:
             
             if not balance_rows:
                 # Show "No Data" only if we really have no data and the tree was empty
+                logger.info("🏦 No balance rows - showing Loading...")
                 self.balance_tree.insert('', 'end', values=(
                     "Loading...", "-", "-", "-", "-", "-"
                 ))
@@ -2768,6 +2938,7 @@ class ArBotGUI:
         
         # Add balance rows to display
         if balance_rows:
+            logger.info(f"🏦 Adding {len(balance_rows)} balance rows to display")
             for row in balance_rows:
                 # Format values for display
                 free_str = f"{row['free']:.6f}".rstrip('0').rstrip('.')
@@ -2778,8 +2949,14 @@ class ArBotGUI:
                 usd_value = "-"
                 asset = row['asset']
                 total = row['total']
+                exchange_name = row['exchange']
+                
                 if asset.upper() == 'USDT' or asset.upper() == 'USD':
                     usd_value = f"${total:.2f}"
+                elif asset.upper() == 'KRW' and total > 0:
+                    # Korean Won - convert to USD using approximate rate
+                    usd_amount = total / 1350.0  # Approximate KRW/USD rate
+                    usd_value = f"~${usd_amount:.2f}"
                 elif asset.upper() == 'BTC' and total > 0:
                     # Rough estimate - would need real BTC price
                     usd_value = f"~${total * 70000:.0f}"
@@ -2789,7 +2966,7 @@ class ArBotGUI:
                 
                 # Color coding based on asset type
                 tag = ""
-                if asset.upper() in ['USDT', 'USD', 'USDC']:
+                if asset.upper() in ['USDT', 'USD', 'USDC', 'KRW']:
                     tag = "stablecoin"
                 elif asset.upper() in ['BTC', 'ETH']:
                     tag = "major_crypto"
@@ -2813,7 +2990,8 @@ class ArBotGUI:
     async def _on_arbitrage_signal(self, signal: ArbitrageSignal):
         """Handle arbitrage signal"""
         try:
-            logger.info(f"Arbitrage opportunity: {signal.symbol} "
+            logger.info(f"🔔 ARBITRAGE SIGNAL: {signal.symbol} "
+                       f"{signal.buy_exchange} -> {signal.sell_exchange} "
                        f"{signal.profit_percent*100:.3f}% profit")
             
             # Update opportunities list
@@ -2821,11 +2999,15 @@ class ArBotGUI:
             if len(self.current_opportunities) > 10:
                 self.current_opportunities.pop()
             
+            logger.info(f"🔔 Updated opportunities list, now has {len(self.current_opportunities)} items")
+            
             # Update UI
             self.root.after(0, self.update_opportunities_display)
             
         except Exception as e:
             logger.error(f"Error processing arbitrage signal: {e}")
+            import traceback
+            logger.error(f"Signal callback traceback: {traceback.format_exc()}")
     
     async def get_common_symbols_with_volume(self) -> List[str]:
         """Dynamically detect common symbols across exchanges"""

@@ -43,8 +43,8 @@
       "taker_fee": 0.001
     },
     "bybit": {
-      "enabled": true,
-      "arbitrage_enabled": true,
+      "enabled": false,
+      "arbitrage_enabled": false,
       "testnet": false,
       "region": "global",
       "premium_baseline": 0.0,
@@ -70,8 +70,8 @@
       "taker_fee": 0.001
     },
     "upbit": {
-      "enabled": false,
-      "arbitrage_enabled": false,
+      "enabled": true,
+      "arbitrage_enabled": true,
       "testnet": false,
       "region": "korea",
       "premium_baseline": 2.5,

@@ -28,8 +28,14 @@ class UpbitExchange(BaseExchange):
         self._rate_last_updated = 0
         
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+        # Always create a fresh session to avoid event loop conflicts
+        if self.session and not self.session.closed:
+            try:
+                await self.session.close()
+            except:
+                pass
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
     
     def _generate_jwt_token(self, query_params: Optional[Dict] = None) -> str:
@@ -75,26 +81,11 @@ class UpbitExchange(BaseExchange):
             raise e
     
     async def _get_krw_to_usd_rate(self) -> float:
-        """Get current KRW to USD exchange rate with caching"""
-        current_time = time.time()
-        
-        # Update rate every 10 minutes
-        if current_time - self._rate_last_updated > 600:
-            try:
-                # Try to get USD/KRW rate from Upbit
-                data = await self._make_request('GET', '/v1/ticker', {'markets': 'KRW-USDT'})
-                if data:
-                    krw_per_usdt = float(data[0]['trade_price'])
-                    self._krw_to_usd_rate = 1.0 / krw_per_usdt
-                    self._rate_last_updated = current_time
-                    logger.info(f"Updated KRW/USD rate: {self._krw_to_usd_rate:.6f} (1 USD = {krw_per_usdt:.2f} KRW)")
-            except Exception as e:
-                logger.warning(f"Failed to update KRW/USD rate: {e}, using default rate")
-                # Keep existing rate or use default
-                if self._krw_to_usd_rate == 0:
-                    self._krw_to_usd_rate = 1.0 / 1300.0
-        
-        return self._krw_to_usd_rate
+        """Return static KRW to USD rate - Korean exchanges have inherent premium"""
+        # Korean exchanges like Upbit typically have 2%+ premium over global exchanges
+        # We don't calculate real-time rates as this creates network issues and 
+        # the premium is managed separately in arbitrage strategy
+        return 1.0 / 1350.0  # Static approximate rate
     
     async def connect_ws(self, symbols: List[str]) -> None:
         """Connect to Upbit WebSocket and subscribe to ticker data"""

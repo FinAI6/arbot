@@ -25,7 +25,9 @@ class BybitExchange(BaseExchange):
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            # Create session with minimal configuration to avoid event loop issues
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
     
     def _generate_signature(self, timestamp: str, params: str) -> str:

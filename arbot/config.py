@@ -163,6 +163,7 @@ class Config:
         """Update configuration from dictionary"""
         if 'trading_mode' in config_data:
             self.trading_mode = TradingMode(config_data['trading_mode'])
+            self._trading_mode_from_config = True  # Mark that trading_mode was set from config file
         
         if 'exchanges' in config_data:
             for name, exchange_data in config_data['exchanges'].items():
@@ -310,9 +311,9 @@ class Config:
                         taker_fee=0.001
                     )
         
-        # Trading mode
+        # Trading mode - only use env var if not set in config files
         trading_mode = os.getenv("TRADING_MODE")
-        if trading_mode:
+        if trading_mode and not hasattr(self, '_trading_mode_from_config'):
             try:
                 self.trading_mode = TradingMode(trading_mode.lower())
             except ValueError:
