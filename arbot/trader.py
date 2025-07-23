@@ -261,8 +261,8 @@ class LiveTrader:
         quote_asset = 'USDT' if 'USDT' in signal.symbol else 'USDC'
         
         # Check balances on both exchanges
-        buy_balance = self.balances.get(signal.buy_exchange, {}).get(quote_asset, 0)
-        sell_balance = self.balances.get(signal.sell_exchange, {}).get(base_asset, 0)
+        buy_balance = self.balances.get(signal.buy_exchange, {}).get(quote_asset, {}).get('free', 0)
+        sell_balance = self.balances.get(signal.sell_exchange, {}).get(base_asset, {}).get('free', 0)
         
         # Calculate max trade size based on balances
         max_buy_size = buy_balance / signal.buy_price
@@ -293,7 +293,7 @@ class LiveTrader:
         
         # Check buy exchange balance
         quote_asset = 'USDT' if 'USDT' in signal.symbol else 'USDC'
-        buy_balance = self.balances.get(signal.buy_exchange, {}).get(quote_asset, 0)
+        buy_balance = self.balances.get(signal.buy_exchange, {}).get(quote_asset, {}).get('free', 0)
         
         if buy_balance < required_balance:
             logger.warning(f"Insufficient balance on {signal.buy_exchange}: {buy_balance}")
@@ -301,7 +301,7 @@ class LiveTrader:
         
         # Check sell exchange balance
         base_asset = signal.symbol.replace('USDT', '').replace('USDC', '')
-        sell_balance = self.balances.get(signal.sell_exchange, {}).get(base_asset, 0)
+        sell_balance = self.balances.get(signal.sell_exchange, {}).get(base_asset, {}).get('free', 0)
         required_base = required_balance / signal.sell_price
         
         if sell_balance < required_base:
@@ -439,26 +439,49 @@ class LiveTrader:
         """Update balances from all exchanges"""
         try:
             for exchange_name, exchange in self.exchanges.items():
-                balances = await exchange.get_balance()
+                balance_data = await exchange.get_balance()
                 
-                # Store balances
-                self.balances[exchange_name] = {}
-                for asset, balance in balances.items():
-                    self.balances[exchange_name][asset] = balance.free
+                if balance_data and isinstance(balance_data, dict):
+                    processed_balances = {}
+                    for asset, balance_info in balance_data.items():
+                        try:
+                            free_val, locked_val, total_val = 0.0, 0.0, 0.0
+                            if isinstance(balance_info, dict):
+                                free_val = float(balance_info.get('free', 0))
+                                locked_val = float(balance_info.get('locked', 0))
+                                total_val = float(balance_info.get('total', 0))
+                            elif hasattr(balance_info, 'free'):
+                                free_val = float(balance_info.free)
+                                locked_val = float(balance_info.locked)
+                                total_val = float(balance_info.total)
+                            else:
+                                total_val = free_val = float(balance_info)
+                            
+                            if total_val > 1e-8: # Use a smaller threshold
+                                processed_balances[asset] = {
+                                    'free': free_val,
+                                    'locked': locked_val,
+                                    'total': total_val
+                                }
+                                # Store in database
+                                balance_record = BalanceRecord(
+                                    exchange=exchange_name, asset=asset,
+                                    free=free_val, locked=locked_val, total=total_val,
+                                    timestamp=time.time()
+                                )
+                                await self.database.insert_balance(balance_record)
+                        except (ValueError, TypeError, AttributeError) as e:
+                            logger.debug(f"Could not parse balance for {asset} on {exchange_name}: {e}")
+                            continue
                     
-                    # Store in database
-                    balance_record = BalanceRecord(
-                        exchange=exchange_name,
-                        asset=asset,
-                        free=balance.free,
-                        locked=balance.locked,
-                        total=balance.total,
-                        timestamp=time.time()
-                    )
-                    await self.database.insert_balance(balance_record)
-                
+                    if processed_balances:
+                        self.balances[exchange_name] = processed_balances
+                        logger.info(f"Updated balances for {exchange_name}: {len(processed_balances)} assets")
+                else:
+                    logger.warning(f"No balance data returned from {exchange_name}")
+
         except Exception as e:
-            logger.error(f"Error updating balances: {e}")
+            logger.error(f"Error updating balances in Trader: {e}")
     
     async def _balance_monitor(self) -> None:
         """Monitor balances and calculate drawdown"""
@@ -485,21 +508,21 @@ class LiveTrader:
     def _calculate_portfolio_value(self) -> float:
         """Calculate current portfolio value in USD"""
         total_value = 0
-        for exchange_name, exchange_balances in self.balances.items():
-            for asset, balance in exchange_balances.items():
-                if asset in ['USDT', 'USDC', 'USD']:
-                    total_value += balance
-                # For other assets, we'd need price data to convert to USD
-                # This is simplified for now
+        for exchange_balances in self.balances.values():
+            for asset, balance_info in exchange_balances.items():
+                if asset.upper() in ['USDT', 'USDC', 'USD']:
+                    total_value += balance_info.get('total', 0)
+                # Note: This is a simplified calculation. For non-USD assets,
+                # a price conversion would be needed for accuracy.
         return total_value
     
     def _calculate_initial_portfolio_value(self) -> float:
         """Calculate initial portfolio value in USD"""
         total_value = 0
-        for exchange_name, exchange_balances in self.initial_balances.items():
-            for asset, balance in exchange_balances.items():
-                if asset in ['USDT', 'USDC', 'USD']:
-                    total_value += balance
+        for exchange_balances in self.initial_balances.values():
+            for asset, balance_info in exchange_balances.items():
+                if asset.upper() in ['USDT', 'USDC', 'USD']:
+                    total_value += balance_info.get('total', 0)
         return total_value
     
     async def _on_order_update(self, order: Order) -> None:
@@ -533,7 +556,8 @@ class LiveTrader:
             'active_trades': len(self.active_trades),
             'max_drawdown': self.max_drawdown,
             'current_drawdown': self.current_drawdown,
-            'portfolio_value': self._calculate_portfolio_value()
+            'portfolio_value': self._calculate_portfolio_value(),
+            'completed_trades': [] # Placeholder, as this is managed by the GUI
         }
     
     def get_active_trades(self) -> List[ActiveTrade]:

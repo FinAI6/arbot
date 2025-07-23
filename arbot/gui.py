@@ -16,7 +16,7 @@ from .strategy import ArbitrageStrategy, ArbitrageSignal
 from .trader import LiveTrader
 from .simulator import TradingSimulator
 from .backtester import Backtester
-from .exchanges import BinanceExchange, BybitExchange
+from .exchanges import BinanceExchange, BybitExchange, UpbitExchange
 
 logger = logging.getLogger(__name__)
 
@@ -599,6 +599,12 @@ class ArBotGUI:
                         )
                     elif exchange_name == 'bybit':
                         exchange = BybitExchange(
+                            api_key,
+                            api_secret,
+                            exchange_config.testnet
+                        )
+                    elif exchange_name == 'upbit':
+                        exchange = UpbitExchange(
                             api_key,
                             api_secret,
                             exchange_config.testnet
@@ -2419,68 +2425,45 @@ class ArBotGUI:
                 self.current_opportunities = self.strategy.get_recent_signals(10)
             
             # Update trader/simulator stats and balances
-            if self.trader and self.config.trading_mode == TradingMode.LIVE:
+            # Debug: Log current mode and components status
+            if self._update_data_count % 100 == 1:
+                logger.info(f"🔧 Mode: {self.config.trading_mode.value}, Trader: {self.trader is not None}, Simulator: {self.simulator is not None}")
+                logger.info(f"🔧 TradingMode.LIVE: {TradingMode.LIVE}, TradingMode.SIMULATION: {TradingMode.SIMULATION}")
+            
+            if self.config.trading_mode == TradingMode.LIVE and self.trader:
+                # In LIVE mode, the trader is the source of truth for balances.
+                self.current_balances = self.trader.balances
                 trader_stats = self.trader.get_stats()
-                trader_balances = trader_stats.get('balances', {})
-                # Only use trader balances if they exist, otherwise keep real exchange balances
-                if trader_balances:
-                    self.current_balances = trader_balances
-                    logger.info(f"🏦 Using trader balances: {list(trader_balances.keys())}")
-                else:
-                    logger.info(f"🏦 Trader has no balances, keeping real exchange balances: {list(self.current_balances.keys()) if self.current_balances else 'None'}")
                 completed_trades = trader_stats.get('completed_trades', [])
-            elif self.simulator:
+                # Log balance source for debugging
+                if self._update_data_count % 20 == 1: # Log less frequently
+                    logger.info(f"🏦 Live mode: Using balances from trader. {len(self.current_balances)} exchanges.")
+
+            elif self.config.trading_mode == TradingMode.SIMULATION and self.simulator:
                 sim_stats = self.simulator.get_stats()
-                sim_balances = sim_stats.get('balances', {})
-                # Only use simulator balances if they exist, otherwise use simulated defaults
-                if sim_balances:
-                    self.current_balances = sim_balances
-                else:
-                    # Keep existing balances (could be real or simulated)
-                    pass
+                self.current_balances = sim_stats.get('balances', {})
                 completed_trades = sim_stats.get('completed_trades', [])
                 
                 # Update profit display
                 portfolio_value = sim_stats.get('portfolio_value', 0)
-                initial_value = 30000  # Default initial portfolio value
+                initial_value = self.config.backtest.initial_balance
                 profit = portfolio_value - initial_value
                 self.root.after(0, lambda: self.profit_label.config(text=f"Profit: ${profit:.2f}"))
             else:
                 completed_trades = []
+                if self._update_data_count % 100 == 1:
+                    logger.info(f"🚨 Neither trader nor simulator available - Mode: {self.config.trading_mode.value}")
             
-            # Check if we need to update balances (rate-limited)
-            should_update_balances = (
-                current_time - self.last_balance_update > self.balance_update_interval
-            )
-            
-            # If we don't have balance data yet, try to fetch it
-            if not self.current_balances and self.exchanges:
-                if self.config.trading_mode == TradingMode.SIMULATION:
-                    # Provide simulated balance data for demo purposes
-                    self.current_balances = {
-                        exchange_name: {
-                            'USDT': {'free': 10000.0, 'locked': 0.0, 'total': 10000.0},
-                            'BTC': {'free': 0.15, 'locked': 0.0, 'total': 0.15},
-                            'ETH': {'free': 4.2, 'locked': 0.0, 'total': 4.2}
-                        }
-                        for exchange_name in self.exchanges.keys()
+            # In SIMULATION mode, if balances are empty, provide mock data.
+            if self.config.trading_mode == TradingMode.SIMULATION and not self.current_balances:
+                self.current_balances = {
+                    exchange_name: {
+                        'USDT': {'free': 10000.0, 'locked': 0.0, 'total': 10000.0},
+                        'BTC': {'free': 0.15, 'locked': 0.0, 'total': 0.15},
+                        'ETH': {'free': 4.2, 'locked': 0.0, 'total': 4.2}
                     }
-                else:
-                    # In live mode, fetch real balances from exchanges (rate-limited)
-                    if should_update_balances:
-                        await self._update_real_balances()
-                        self.last_balance_update = current_time
-            
-            # Update real balances in live mode periodically (rate-limited)
-            elif (self.config.trading_mode == TradingMode.LIVE and 
-                  self.exchanges and should_update_balances):
-                logger.info(f"Updating balances (last update: {int(current_time - self.last_balance_update)}s ago)")
-                await self._update_real_balances()
-                self.last_balance_update = current_time
-            elif (self.config.trading_mode == TradingMode.LIVE and 
-                  self.exchanges and not should_update_balances):
-                time_until_next_update = self.balance_update_interval - (current_time - self.last_balance_update)
-                logger.debug(f"Balance update rate-limited (next update in {int(time_until_next_update)}s)")
+                    for exchange_name in self.exchanges.keys()
+                }
             
             # Update recent trades
             if completed_trades:
